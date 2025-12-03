@@ -7,7 +7,7 @@ import time
 import google.generativeai as genai
 from netmiko import ConnectHandler
 
-# Cisco DevNet Sandbox (Nexus 9000)
+# Cisco DevNet Sandbox
 SANDBOX_DEVICE = {
     'device_type': 'cisco_nxos',
     'host': 'sandbox-nxos-1.cisco.com',
@@ -33,18 +33,60 @@ def sanitize_output(text: str) -> str:
     return text
 
 def generate_fake_log_by_ai(scenario_name, api_key):
-    """AIにそれっぽいログを捏造させる"""
+    """
+    シナリオに応じた適切な制約条件を与えてログを生成する
+    """
     if not api_key: return "Error: API Key Missing"
     
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel("gemini-2.0-flash")
     
+    # シナリオごとの厳格な制約条件 (AIの暴走防止)
+    constraints = ""
+    
+    if "片系" in scenario_name or "FAN" in scenario_name or "メモリ" in scenario_name:
+        constraints = """
+        【重要：ログ生成の絶対条件】
+        1. **全てのインターフェース(GigabitEthernet等)は UP/UP (正常) にすること。**
+        2. Ping疎通は **100% 成功 (!!!!!)** すること。
+        3. ルーティングテーブルは正常に表示すること。
+        4. 障害は `show environment` や `show processes memory` の結果、および `syslog` メッセージのみで表現すること。
+        5. 通信断を示唆するログは一切含めないこと。
+        """
+    elif "全回線断" in scenario_name or "両系" in scenario_name:
+        constraints = """
+        【重要：ログ生成の絶対条件】
+        1. 主要インターフェースは **DOWN/DOWN** または **Administratively Down** にすること。
+        2. Ping疎通は **0% (.....)** にすること。
+        """
+    elif "BGP" in scenario_name:
+        constraints = """
+        【重要：ログ生成の絶対条件】
+        1. 物理インターフェースは **UP/UP** にすること。
+        2. Pingは通ること。
+        3. `show ip bgp summary` の State が Idle または Active (確立中) でフラついている様子を見せること。
+        """
+
     prompt = f"""
-    Cisco IOS/NX-OS のコマンド実行結果（ログ）を生成してください。
-    シナリオ: {scenario_name}
-    対象: WAN_ROUTER_01
-    要件: 生ログのみ出力。解説不要。障害を示すエラーログを含めること。
+    あなたはCiscoネットワーク機器のシミュレーターです。
+    以下のシナリオに基づき、エンジニアが調査した際のコマンド実行ログを生成してください。
+
+    **発生シナリオ**: {scenario_name}
+    **対象機器**: Cisco IOS Router (WAN_ROUTER_01)
+
+    {constraints}
+
+    **出力すべきコマンド例**:
+    - `show version`
+    - `show ip interface brief`
+    - `show environment` (ハードウェア障害の場合)
+    - `show log` (エラーメッセージ)
+    - `ping <対向IP>`
+
+    **出力形式**:
+    解説やMarkdownの装飾は不要です。CLIの生テキストのみを出力してください。
     """
+    
     try:
         response = model.generate_content(prompt)
         return response.text
@@ -52,16 +94,13 @@ def generate_fake_log_by_ai(scenario_name, api_key):
         return f"AI Generation Error: {e}"
 
 def run_diagnostic_simulation(scenario_type, api_key=None):
-    """
-    診断実行関数 (修正版: api_key引数を明示)
-    """
+    """診断実行関数"""
     time.sleep(1.5)
     
     status = "SUCCESS"
     raw_output = ""
     error_msg = None
 
-    # 区切り線や無効な選択の場合
     if "---" in scenario_type or "正常" in scenario_type:
         return {"status": "SKIPPED", "sanitized_log": "No action required.", "error": None}
 
