@@ -43,14 +43,7 @@ def render_topology(alarms, root_cause_node, root_severity="CRITICAL"):
         elif node_id in alarmed_ids:
             color = "#fff9c4" # 連鎖アラーム
         
-        graph.node(
-            node_id, 
-            label=label, 
-            fillcolor=color, 
-            color='black', 
-            penwidth=str(penwidth), 
-            fontcolor=fontcolor
-        )
+        graph.node(node_id, label=label, fillcolor=color, color='black', penwidth=penwidth, fontcolor=fontcolor)
     
     for node_id, node in TOPOLOGY.items():
         if node.parent_id:
@@ -137,6 +130,7 @@ if "current_scenario" not in st.session_state:
     st.session_state.live_result = None
     st.session_state.trigger_analysis = False
 
+# シナリオ変更時のリセット処理
 if st.session_state.current_scenario != selected_scenario:
     st.session_state.current_scenario = selected_scenario
     st.session_state.messages = []
@@ -165,12 +159,14 @@ else:
     elif "[L2SW]" in selected_scenario: target_device = "L2_SW_01"
 
     if target_device:
+        # 電源障害
         if "電源障害：片系" in selected_scenario:
             alarms = [Alarm(target_device, "Power Supply 1 Failed", "WARNING")]
             root_severity = "WARNING"
         elif "電源障害：両系" in selected_scenario:
             alarms = simulate_cascade_failure(target_device, TOPOLOGY)
             root_severity = "CRITICAL"
+        # その他
         elif "BGP" in selected_scenario:
             alarms = [Alarm(target_device, "BGP Flapping", "WARNING")]
             root_severity = "WARNING"
@@ -190,6 +186,7 @@ if alarms:
     inference_result = engine.analyze_alarms(alarms)
     root_cause = inference_result.root_cause_node
     reason = inference_result.root_cause_reason
+    
     if inference_result.severity == "CRITICAL":
         root_severity = "CRITICAL"
     elif inference_result.severity == "WARNING":
@@ -198,6 +195,7 @@ if alarms:
 # --- メイン画面 ---
 col1, col2 = st.columns([1, 1])
 
+# 左カラム
 with col1:
     st.subheader("Network Status")
     st.graphviz_chart(render_topology(alarms, root_cause, root_severity), use_container_width=True)
@@ -222,7 +220,9 @@ with col1:
             else:
                 with st.status("Agent Operating...", expanded=True) as status:
                     st.write("🔌 Executing Diagnostics...")
+                    
                     res = run_diagnostic_simulation(selected_scenario, api_key)
+                    
                     st.session_state.live_result = res
                     
                     if res["status"] == "SUCCESS":
@@ -248,6 +248,7 @@ with col1:
             elif res["status"] == "ERROR":
                 st.error(f"診断結果: {res['error']}")
 
+# 右カラム
 with col2:
     st.subheader("AI Analyst Report")
     if not api_key: st.stop()
@@ -280,6 +281,7 @@ with col2:
         live_data = st.session_state.live_result
         log_content = live_data.get('sanitized_log') or f"Error: {live_data.get('error')}"
         
+        # 【修正】AIへの指示を「正直に答える」ように変更
         prompt = f"""
         診断コマンドを実行しました。以下の結果に基づき『ネクストアクション実行レポート』を作成してください。
         
@@ -288,10 +290,12 @@ with col2:
         ログ: {log_content}
         
         【出力要件】
-        0. **診断結論 (最重要):** ログ分析から特定された障害原因を簡潔に（例：電源モジュールAの故障）
+        0. **診断結論:**
+           - ログから原因が明確に特定できる場合: その原因を断定的に記述。
+           - ログから原因が特定できない場合(曖昧な場合): 「現時点のログでは真因の特定に至らず」と明記し、可能性のある要因を挙げるに留めること。無理に原因を捏造しないこと。
         1. 接続結果 (成功/失敗)
         2. ログ分析 (インターフェース状態、ルート情報、環境変数など)
-        3. 推奨アクション (交換、再起動、静観など)
+        3. 推奨アクション (真因が不明な場合は、詳細調査のための追加コマンドやベンダー問い合わせを推奨する)
         """
         st.session_state.messages.append({"role": "user", "content": "診断結果を分析してください。"})
         
