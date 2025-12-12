@@ -38,9 +38,9 @@ def generate_fake_log_by_ai(scenario_name, target_node, api_key):
     if not api_key: return "Error: API Key Missing"
     
     genai.configure(api_key=api_key)
-    # ★変更: gemini-2.0-flash-lite + 温度0
+    # ★変更: gemma-3-12b-it + 温度0
     model = genai.GenerativeModel(
-        "gemini-2.0-flash-lite",
+        "gemma-3-12b-it",
         generation_config={"temperature": 0.0}
     )
     
@@ -127,7 +127,7 @@ def generate_fake_log_by_ai(scenario_name, target_node, api_key):
 def generate_config_from_intent(target_node, current_config, intent_text, api_key):
     if not api_key: return "Error: API Key Missing"
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.0-flash-lite", generation_config={"temperature": 0.0})
+    model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
     
     vendor = target_node.metadata.get("vendor", "Cisco")
     os_type = target_node.metadata.get("os", "IOS")
@@ -148,7 +148,7 @@ def generate_config_from_intent(target_node, current_config, intent_text, api_ke
 def generate_health_check_commands(target_node, api_key):
     if not api_key: return "Error: API Key Missing"
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.0-flash-lite", generation_config={"temperature": 0.0})
+    model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
     
     vendor = target_node.metadata.get("vendor", "Cisco")
     os_type = target_node.metadata.get("os", "IOS")
