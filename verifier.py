@@ -1,16 +1,15 @@
 """
-Google Antigravity AIOps Agent - Verification Module (Optimized Final)
+Google Antigravity AIOps Agent - Verification Module
 ハルシネーション防止のための高速・高精度な検証モジュール
 """
 import re
-from typing import Dict, List, Optional, Tuple
 
 # =====================================================
-# 軽量パターンキャッシュ（遅延初期化）
+# パターンキャッシュ（遅延初期化クラス）
 # =====================================================
 
 class _PatternCache:
-    """シングルトンパターンキャッシュ"""
+    """正規表現パターンを保持するシングルトン"""
     _instance = None
     _initialized = False
     
@@ -25,7 +24,7 @@ class _PatternCache:
             self._initialized = True
     
     def _compile_patterns(self):
-        # Pingパターン（統合版）
+        # Pingパターン
         self.ping_stats = re.compile(
             r'(?:(\d+)\s+packets?\s+transmitted.*?(\d+)\s+received)|'
             r'(?:success\s+rate\s+is\s+(\d+)\s*percent)|'
@@ -34,7 +33,7 @@ class _PatternCache:
         )
         self.ping_fail_fast = re.compile(r'(100%\s+packet\s+loss|unreachable|timed?\s*out|0\s+received)', re.I)
         
-        # インターフェース（統合版）
+        # インターフェース
         self.admin_down = re.compile(r'administratively\s+down', re.I)
         self.if_status = re.compile(
             r'(?:line\s+protocol\s+is\s+(up|down))|'
@@ -43,16 +42,14 @@ class _PatternCache:
             re.I
         )
         
-        # ハードウェア（統合版）
-        # 注意: DOTALLは広範囲にマッチしすぎるリスクがあるため、行単位に近い判定を優先する設計が望ましいが
-        # ここでは同僚案を尊重しつつ採用する。
+        # ハードウェア
         self.hw_check = re.compile(
             r'(fan|power|psu|temp|environment|sensor).*?'
             r'(fail(ed|ure)?|fault(y)?|critical|ok|good|normal|warn(ing)?)',
             re.I | re.DOTALL
         )
 
-_cache = None  # 遅延初期化
+_cache = None
 
 def _get_cache():
     global _cache
@@ -61,23 +58,27 @@ def _get_cache():
     return _cache
 
 # =====================================================
-# 高速検証関数
+# 検証ロジック
 # =====================================================
 
 def verify_log_content(log_text: str) -> dict:
     """
-    最適化版：妥当性を保ちつつ処理速度を向上
+    ログテキストから客観的事実を抽出する
     """
+    # 空の結果定義
+    result = {
+        "ping_status": "Unknown", "ping_confidence": 0.0, "ping_evidence": "",
+        "interface_status": "Unknown", "interface_confidence": 0.0, "interface_evidence": "",
+        "hardware_status": "Unknown", "hardware_confidence": 0.0, "hardware_evidence": "",
+        "error_keywords": "None", "error_severity": 0.0,
+        "conflicts_detected": [], "overall_confidence": 0.0
+    }
+
     if not log_text:
-        return _empty_result()
+        return result
     
     cache = _get_cache()
     text_lower = log_text.lower()
-    
-    result = {
-        "overall_confidence": 0.0,
-        "conflicts_detected": []
-    }
     
     # 1. Ping検証
     _fast_verify_ping(text_lower, cache, result)
@@ -88,12 +89,6 @@ def verify_log_content(log_text: str) -> dict:
     # 3. Hardware検証
     if any(kw in text_lower for kw in ['fan', 'power', 'psu', 'temp', 'environment']):
         _fast_verify_hardware(text_lower, cache, result)
-    else:
-        result.update({
-            "hardware_status": "Unknown",
-            "hardware_confidence": 0.0,
-            "hardware_evidence": ""
-        })
     
     # 4. エラーキーワード
     _fast_verify_errors(text_lower, result)
@@ -101,8 +96,7 @@ def verify_log_content(log_text: str) -> dict:
     # 5. 矛盾検知
     _detect_simple_conflicts(result)
     
-    # 全体信頼度計算 (修正版: maxを採用)
-    # どこか一箇所でも確信があれば、それを全体信頼度とする
+    # 全体信頼度計算
     confidences = [
         result.get("ping_confidence", 0),
         result.get("interface_confidence", 0),
@@ -112,18 +106,8 @@ def verify_log_content(log_text: str) -> dict:
     
     return result
 
-def _empty_result() -> dict:
-    return {
-        "ping_status": "Unknown", "ping_confidence": 0.0, "ping_evidence": "",
-        "interface_status": "Unknown", "interface_confidence": 0.0, "interface_evidence": "",
-        "hardware_status": "Unknown", "hardware_confidence": 0.0, "hardware_evidence": "",
-        "error_keywords": "None", "error_severity": 0.0,
-        "conflicts_detected": [], "overall_confidence": 0.0
-    }
-
 def _fast_verify_ping(text: str, cache, result: dict):
     if 'ping' not in text and 'icmp' not in text:
-        result.update({"ping_status": "Unknown", "ping_confidence": 0.0, "ping_evidence": ""})
         return
     
     fail_match = cache.ping_fail_fast.search(text)
@@ -161,15 +145,8 @@ def _fast_verify_ping(text: str, cache, result: dict):
                     "ping_confidence": conf,
                     "ping_evidence": f"Success rate: {success_rate:.0f}%"
                 })
-                return
         except (ValueError, ZeroDivisionError):
             pass
-    
-    result.update({
-        "ping_status": "Unknown",
-        "ping_confidence": 0.3,
-        "ping_evidence": "Ping keyword found but unclear"
-    })
 
 def _fast_verify_interface(text: str, cache, result: dict):
     if cache.admin_down.search(text):
@@ -182,7 +159,6 @@ def _fast_verify_interface(text: str, cache, result: dict):
     
     status_match = cache.if_status.findall(text)
     if not status_match:
-        result.update({"interface_status": "Unknown", "interface_confidence": 0.0, "interface_evidence": ""})
         return
     
     down_count = sum(1 for m in status_match if 'down' in str(m).lower() or 'disabled' in str(m).lower())
@@ -210,7 +186,6 @@ def _fast_verify_interface(text: str, cache, result: dict):
 def _fast_verify_hardware(text: str, cache, result: dict):
     hw_matches = cache.hw_check.findall(text)
     if not hw_matches:
-        result.update({"hardware_status": "Unknown", "hardware_confidence": 0.3, "hardware_evidence": ""})
         return
     
     critical_count = sum(1 for m in hw_matches if any(k in str(m).lower() for k in ['fail', 'fault', 'critical']))
@@ -235,9 +210,63 @@ def _fast_verify_hardware(text: str, cache, result: dict):
             "hardware_confidence": 0.8,
             "hardware_evidence": f"HW OK ({ok_count} components)"
         })
-    else:
-        result.update({"hardware_status": "Unknown", "hardware_confidence": 0.3, "hardware_evidence": ""})
 
 def _fast_verify_errors(text: str, result: dict):
     critical_keywords = ['crash', 'panic', 'fatal', 'severe']
-    error
+    error_keywords = ['error', 'fail', 'exception', 'denied']
+    
+    found_critical = [k for k in critical_keywords if k in text]
+    found_errors = [k for k in error_keywords if k in text and k not in found_critical]
+    
+    if found_critical:
+        result.update({
+            "error_keywords": f"Critical: {', '.join(found_critical[:3])}",
+            "error_severity": 0.9
+        })
+    elif found_errors:
+        result.update({
+            "error_keywords": f"Errors: {', '.join(found_errors[:3])}",
+            "error_severity": 0.7
+        })
+
+def _detect_simple_conflicts(result: dict):
+    conflicts = []
+    ping_ok = result.get("ping_status") == "OK"
+    if_down = result.get("interface_status") == "CRITICAL"
+    
+    if ping_ok and if_down:
+        conflicts.append("矛盾検知: Ping疎通は成功していますが、I/Fダウンが検出されています")
+    
+    result["conflicts_detected"] = conflicts
+
+# =====================================================
+# レポートフォーマット関数（必須）
+# =====================================================
+
+def format_verification_report(facts: dict) -> str:
+    """検証結果を整形して返す"""
+    overall_conf = facts.get('overall_confidence', 0)
+    confidence_level = "高" if overall_conf >= 0.8 else "中" if overall_conf >= 0.5 else "低"
+    
+    report = f"""
+【システム自動検証結果 (Ground Truth)】
+※AIの推論はこの客観的事実と矛盾してはならない
+
+◆ 総合信頼度: {confidence_level} ({overall_conf:.0%})
+
+◆ 疎通: {facts.get('ping_status', 'N/A')} (信頼度: {facts.get('ping_confidence', 0):.0%})
+  → {facts.get('ping_evidence', 'N/A')}
+
+◆ インターフェース: {facts.get('interface_status', 'N/A')} (信頼度: {facts.get('interface_confidence', 0):.0%})
+  → {facts.get('interface_evidence', 'N/A')}
+
+◆ ハードウェア: {facts.get('hardware_status', 'N/A')} (信頼度: {facts.get('hardware_confidence', 0):.0%})
+  → {facts.get('hardware_evidence', 'N/A')}
+
+◆ エラー: {facts.get('error_keywords', 'N/A')}
+"""
+    
+    if facts.get('conflicts_detected'):
+        report += f"\n⚠️ **矛盾検知**: {'; '.join(facts['conflicts_detected'])}\n"
+    
+    return report
