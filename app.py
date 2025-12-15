@@ -135,7 +135,7 @@ if st.session_state.current_scenario != selected_scenario:
     st.session_state.trigger_analysis = False
     st.session_state.verification_result = None
     st.session_state.generated_report = None
-    st.session_state.verification_log = None # 復旧確認ログ
+    st.session_state.verification_log = None 
     if "remediation_plan" in st.session_state: del st.session_state.remediation_plan
     if "bayes_engine" in st.session_state: del st.session_state.bayes_engine
     st.rerun()
@@ -204,7 +204,12 @@ if "bayes_engine" not in st.session_state:
 # 3. コックピット表示
 selected_incident_candidate = None
 if "bayes_engine" in st.session_state:
-    selected_incident_candidate = render_intelligent_alarm_viewer(st.session_state.bayes_engine, selected_scenario)
+    # ★変更点: alarmsを渡して数字を計算させる
+    selected_incident_candidate = render_intelligent_alarm_viewer(
+        st.session_state.bayes_engine, 
+        selected_scenario,
+        alarms
+    )
 
 # 4. 画面分割
 col_map, col_chat = st.columns([1.2, 1])
@@ -253,7 +258,6 @@ with col_map:
                     status.update(label="Diagnostics Failed", state="error")
             st.rerun()
 
-    # ★変更点: 診断結果をここ（左カラム・ボタンの下）に移動
     if st.session_state.live_result:
         res = st.session_state.live_result
         if res["status"] == "SUCCESS":
@@ -286,15 +290,14 @@ with col_chat:
         if "generated_report" not in st.session_state or st.session_state.generated_report is None:
             if api_key and selected_scenario != "正常稼働":
                 
-                # コンテナを先に確保
                 report_container = st.empty()
                 
-                # Config情報の取得
                 target_conf = load_config_by_id(cand['id'])
                 
                 genai.configure(api_key=api_key)
                 model = genai.GenerativeModel("gemma-3-12b-it")
                 
+                # ★修正点: 表示崩れを防ぐための強力なプロンプト
                 prompt = f"""
                 あなたはネットワーク運用監視のプロフェッショナルです。
                 以下の障害インシデントについて、顧客向けの「詳細な状況報告レポート」を作成してください。
@@ -308,24 +311,40 @@ with col_chat:
 
                 【出力フォーマット要件】
                 Markdown形式で出力します。
-                **重要**: 各見出し(### など)と本文の間、およびセクション間には必ず「空行」を入れて、Streamlitできれいに表示されるようにしてください。
+                
+                **重要事項:**
+                1. 見出し(###)や太字(**)を使用する場合、**その前後には必ず空白行（改行）を2つ入れてください。** これを守らないと表示が崩れます。
+                2. 箇条書きリストの前にも必ず改行を入れてください。
                 
                 構成:
                 ### 状況報告：{cand['id']}
+                
                 **1. 障害概要**
+                
+                (ここに概要)
+                
                 **2. 影響**
-                **3. 詳細情報** (機器名、HAグループ、障害内容、バージョン、設定情報など)
+                
+                (ここに影響)
+                
+                **3. 詳細情報**
+                
+                (機器名、HAグループ、障害内容、バージョン、設定情報など)
+                
                 **4. 対応**
+                
+                (対応策)
+                
                 **5. 今後の対応**
+                
+                (今後の予定)
                 """
                 
                 try:
-                    # ★変更点: ストリーミング実行 (stream=True)
                     response = model.generate_content(prompt, stream=True)
                     full_text = ""
                     for chunk in response:
                         full_text += chunk.text
-                        # リアルタイム表示
                         report_container.markdown(full_text)
                     st.session_state.generated_report = full_text
                 except Exception as e:
@@ -333,7 +352,7 @@ with col_chat:
             else:
                  st.session_state.generated_report = "監視中... 異常は検知されていません。"
 
-        # 生成済みレポートの表示（リロード時用）
+        # 生成済みレポートの表示
         elif st.session_state.generated_report:
              st.markdown(st.session_state.generated_report)
     
@@ -365,19 +384,16 @@ with col_chat:
             col_exec1, col_exec2 = st.columns(2)
             
             with col_exec1:
-                # ★変更点: 復旧実行後の検証ロジックを追加
                 if st.button("🚀 修復実行 (Execute)", type="primary"):
                     if not api_key:
                         st.error("API Key Required")
                     else:
                         with st.status("Autonomic Remediation in progress...", expanded=True) as status:
                             st.write("⚙️ Applying Configuration...")
-                            time.sleep(1.5) # コマンド投入の演出
+                            time.sleep(1.5) 
                             
                             st.write("🔎 Running Verification Commands...")
-                            # ここで「正常稼働」状態のログをAIに生成させて検証する
                             target_node_obj = TOPOLOGY.get(selected_incident_candidate["id"])
-                            # "正常稼働" というシナリオ名でログを作らせると、All OKなログが返るはず
                             verification_log = generate_fake_log_by_ai("正常稼働", target_node_obj, api_key)
                             st.session_state.verification_log = verification_log
                             
@@ -392,12 +408,11 @@ with col_chat:
                     st.session_state.verification_log = None
                     st.rerun()
             
-            # --- 検証結果の表示と手動確認 ---
+            # --- 検証結果の表示 ---
             if st.session_state.get("verification_log"):
                 st.markdown("#### 🔎 Post-Fix Verification Logs")
                 st.code(st.session_state.verification_log, language="text")
                 
-                # ログの内容に基づいて成功判定（簡易的）
                 is_success = "up" in st.session_state.verification_log.lower() or "ok" in st.session_state.verification_log.lower()
                 
                 if is_success:
@@ -406,7 +421,6 @@ with col_chat:
                 else:
                     st.warning("⚠️ Verification indicates potential issues. Please check manually.")
 
-                # 手動検証ボタン（念のため）
                 if st.button("🔄 手動検証 (Manual Verify)"):
                     with st.spinner("Re-running verification..."):
                         target_node_obj = TOPOLOGY.get(selected_incident_candidate["id"])
@@ -436,7 +450,6 @@ with col_chat:
             if st.session_state.chat_session:
                 with st.chat_message("assistant"):
                     with st.spinner("Thinking..."):
-                        # チャットもストリーミングで応答
                         res_container = st.empty()
                         response = st.session_state.chat_session.send_message(prompt, stream=True)
                         full_response = ""
