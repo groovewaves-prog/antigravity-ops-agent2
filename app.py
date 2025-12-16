@@ -1,585 +1,255 @@
-import streamlit as st
-import graphviz
-import os
-import time
-import google.generativeai as genai
 import json
-import pandas as pd
-from google.api_core import exceptions as google_exceptions
+import os
+import re
+import google.generativeai as genai
+from enum import Enum
+from typing import List, Dict, Any
 
-# モジュール群のインポート
-from data import TOPOLOGY
-from logic import CausalInferenceEngine, Alarm, simulate_cascade_failure
-from network_ops import run_diagnostic_simulation, generate_remediation_commands, predict_initial_symptoms, generate_fake_log_by_ai
-from verifier import verify_log_content, format_verification_report
-from inference_engine import LogicalRCA
+# AIOpsの判定ステータス
+class HealthStatus(Enum):
+    NORMAL = "GREEN"
+    WARNING = "YELLOW"
+    CRITICAL = "RED"
 
-# --- ページ設定 ---
-st.set_page_config(page_title="Antigravity Autonomous", page_icon="⚡", layout="wide")
-
-# ==========================================
-# 関数定義
-# ==========================================
-def find_target_node_id(topology, node_type=None, layer=None, keyword=None):
-    """トポロジーから条件に合うノードIDを検索"""
-    for node_id, node in topology.items():
-        if node_type and node.type != node_type: continue
-        if layer and node.layer != layer: continue
-        if keyword:
-            hit = False
-            if keyword in node_id: hit = True
-            for v in node.metadata.values():
-                if isinstance(v, str) and keyword in v: hit = True
-            if not hit: continue
-        return node_id
-    return None
-
-def load_config_by_id(device_id):
-    """configsフォルダから設定ファイルを読み込む"""
-    possible_paths = [f"configs/{device_id}.txt", f"{device_id}.txt"]
-    for path in possible_paths:
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    return f.read()
-            except Exception:
-                pass
-    return "Config file not found."
-
-def generate_content_with_retry(model, prompt, stream=True, retries=3):
-    """503エラー対策のリトライ付き生成関数"""
-    for i in range(retries):
-        try:
-            return model.generate_content(prompt, stream=stream)
-        except google_exceptions.ServiceUnavailable:
-            if i == retries - 1: raise
-            time.sleep(2 * (i + 1))
-    return None
-
-def render_topology(alarms, root_cause_candidates):
-    """トポロジー図の描画 (AI判定結果を反映)"""
-    graph = graphviz.Digraph()
-    graph.attr(rankdir='TB')
-    graph.attr('node', shape='box', style='rounded,filled', fontname='Helvetica')
-    
-    alarm_map = {a.device_id: a for a in alarms}
-    alarmed_ids = set(alarm_map.keys())
-    
-    root_cause_ids = {c['id'] for c in root_cause_candidates if c['prob'] > 0.6}
-    
-    # AI判定結果のマッピング
-    node_status_map = {c['id']: c['type'] for c in root_cause_candidates}
-    
-    for node_id, node in TOPOLOGY.items():
-        color = "#e8f5e9"
-        penwidth = "1"
-        fontcolor = "black"
-        label = f"{node_id}\n({node.type})"
-        
-        red_type = node.metadata.get("redundancy_type")
-        if red_type: label += f"\n[{red_type} Redundancy]"
-        vendor = node.metadata.get("vendor")
-        if vendor: label += f"\n[{vendor}]"
-
-        status_type = node_status_map.get(node_id, "Normal")
-        
-        if "Hardware/Physical" in status_type or "Critical" in status_type or "Silent" in status_type:
-            color = "#ffcdd2" 
-            penwidth = "3"
-            label += "\n[ROOT CAUSE]"
-        elif "Network/Unreachable" in status_type or "Network/Secondary" in status_type:
-            color = "#cfd8dc" 
-            fontcolor = "#546e7a"
-            label += "\n[Unreachable]"
-        elif node_id in alarmed_ids:
-            color = "#fff9c4" 
-        
-        graph.node(node_id, label=label, fillcolor=color, color='black', penwidth=penwidth, fontcolor=fontcolor)
-    
-    for node_id, node in TOPOLOGY.items():
-        if node.parent_id:
-            graph.edge(node.parent_id, node_id)
-            parent_node = TOPOLOGY.get(node.parent_id)
-            if parent_node and parent_node.redundancy_group:
-                partners = [n.id for n in TOPOLOGY.values() 
-                           if n.redundancy_group == parent_node.redundancy_group and n.id != parent_node.id]
-                for partner_id in partners:
-                    graph.edge(partner_id, node_id)
-    return graph
-
-# --- UI構築 ---
-st.title("⚡ Antigravity Autonomous Agent")
-
-api_key = None
-if "GOOGLE_API_KEY" in st.secrets:
-    api_key = st.secrets["GOOGLE_API_KEY"]
-else:
-    api_key = os.environ.get("GOOGLE_API_KEY")
-
-# --- サイドバー ---
-with st.sidebar:
-    st.header("⚡ Scenario Controller")
-    SCENARIO_MAP = {
-        "基本・広域障害": ["正常稼働", "1. WAN全回線断", "2. FW片系障害", "3. L2SWサイレント障害"],
-        "WAN Router": ["4. [WAN] 電源障害：片系", "5. [WAN] 電源障害：両系", "6. [WAN] BGPルートフラッピング", "7. [WAN] FAN故障", "8. [WAN] メモリリーク"],
-        "Firewall (Juniper)": ["9. [FW] 電源障害：片系", "10. [FW] 電源障害：両系", "11. [FW] FAN故障", "12. [FW] メモリリーク"],
-        "L2 Switch": ["13. [L2SW] 電源障害：片系", "14. [L2SW] 電源障害：両系", "15. [L2SW] FAN故障", "16. [L2SW] メモリリーク"],
-        "複合・その他": ["17. [WAN] 複合障害：電源＆FAN", "18. [Complex] 同時多発：FW & AP", "99. [Live] Cisco実機診断"]
-    }
-    selected_category = st.selectbox("対象カテゴリ:", list(SCENARIO_MAP.keys()))
-    selected_scenario = st.radio("発生シナリオ:", SCENARIO_MAP[selected_category])
-    st.markdown("---")
-    if api_key: st.success("API Connected")
-    else:
-        st.warning("API Key Missing")
-        user_key = st.text_input("Google API Key", type="password")
-        if user_key: api_key = user_key
-
-# --- セッション管理 ---
-if "current_scenario" not in st.session_state:
-    st.session_state.current_scenario = "正常稼働"
-
-# 変数初期化
-for key in ["live_result", "messages", "chat_session", "trigger_analysis", "verification_result", "generated_report", "verification_log", "last_report_cand_id", "logic_engine"]:
-    if key not in st.session_state:
-        st.session_state[key] = None if key != "messages" and key != "trigger_analysis" else ([] if key == "messages" else False)
-
-# エンジン初期化
-if not st.session_state.logic_engine:
-    st.session_state.logic_engine = LogicalRCA(TOPOLOGY)
-
-# シナリオ切り替え時のリセット
-if st.session_state.current_scenario != selected_scenario:
-    st.session_state.current_scenario = selected_scenario
-    st.session_state.messages = []      
-    st.session_state.chat_session = None 
-    st.session_state.live_result = None 
-    st.session_state.trigger_analysis = False
-    st.session_state.verification_result = None
-    st.session_state.generated_report = None
-    st.session_state.verification_log = None 
-    st.session_state.last_report_cand_id = None
-    if "remediation_plan" in st.session_state: del st.session_state.remediation_plan
-    st.rerun()
-
-# ==========================================
-# メインロジック
-# ==========================================
-alarms = []
-target_device_id = None
-root_severity = "CRITICAL"
-is_live_mode = False
-
-# 1. アラーム生成ロジック
-if "Live" in selected_scenario: is_live_mode = True
-elif "WAN全回線断" in selected_scenario:
-    target_device_id = find_target_node_id(TOPOLOGY, node_type="ROUTER")
-    if target_device_id: alarms = simulate_cascade_failure(target_device_id, TOPOLOGY)
-elif "FW片系障害" in selected_scenario:
-    target_device_id = find_target_node_id(TOPOLOGY, node_type="FIREWALL")
-    if target_device_id:
-        alarms = [Alarm(target_device_id, "Heartbeat Loss", "WARNING")]
-        root_severity = "WARNING"
-
-elif "L2SWサイレント障害" in selected_scenario:
-    target_device_id = "L2_SW_01"
-    if target_device_id not in TOPOLOGY:
-        target_device_id = find_target_node_id(TOPOLOGY, keyword="L2_SW")
-    if target_device_id and target_device_id in TOPOLOGY:
-        child_nodes = [nid for nid, n in TOPOLOGY.items() if n.parent_id == target_device_id]
-        alarms = [Alarm(child, "Connection Lost", "CRITICAL") for child in child_nodes]
-    else:
-        st.error("Error: L2 Switch definition not found")
-
-elif "複合障害" in selected_scenario:
-    target_device_id = find_target_node_id(TOPOLOGY, node_type="ROUTER")
-    if target_device_id:
-        alarms = [
-            Alarm(target_device_id, "Power Supply 1 Failed", "CRITICAL"),
-            Alarm(target_device_id, "Fan Fail", "WARNING")
-        ]
-elif "同時多発" in selected_scenario:
-    fw_node = find_target_node_id(TOPOLOGY, node_type="FIREWALL")
-    ap_node = find_target_node_id(TOPOLOGY, node_type="ACCESS_POINT")
-    alarms = []
-    if fw_node: alarms.append(Alarm(fw_node, "Heartbeat Loss", "WARNING"))
-    if ap_node: alarms.append(Alarm(ap_node, "Connection Lost", "CRITICAL"))
-    target_device_id = fw_node 
-else:
-    if "[WAN]" in selected_scenario: target_device_id = find_target_node_id(TOPOLOGY, node_type="ROUTER")
-    elif "[FW]" in selected_scenario: target_device_id = find_target_node_id(TOPOLOGY, node_type="FIREWALL")
-    elif "[L2SW]" in selected_scenario: target_device_id = find_target_node_id(TOPOLOGY, node_type="SWITCH", layer=4)
-
-    if target_device_id:
-        if "電源障害：片系" in selected_scenario:
-            alarms = [Alarm(target_device_id, "Power Supply 1 Failed", "WARNING")]
-            root_severity = "WARNING"
-        elif "電源障害：両系" in selected_scenario:
-            if "FW" in target_device_id:
-                alarms = [Alarm(target_device_id, "Power Supply: Dual Loss (Device Down)", "CRITICAL")]
-            else:
-                alarms = simulate_cascade_failure(target_device_id, TOPOLOGY, "Power Supply: Dual Loss (Device Down)")
-        elif "BGP" in selected_scenario:
-            alarms = [Alarm(target_device_id, "BGP Flapping", "WARNING")]
-            root_severity = "WARNING"
-        elif "FAN" in selected_scenario:
-            alarms = [Alarm(target_device_id, "Fan Fail", "WARNING")]
-            root_severity = "WARNING"
-        elif "メモリ" in selected_scenario:
-            alarms = [Alarm(target_device_id, "Memory High", "WARNING")]
-            root_severity = "WARNING"
-
-# 2. 推論エンジンによる分析
-analysis_results = st.session_state.logic_engine.analyze(alarms)
-
-# 3. コックピット表示
-selected_incident_candidate = None
-
-st.markdown("### 🛡️ AIOps インシデント・コックピット")
-col1, col2, col3 = st.columns(3)
-with col1: st.metric("📉 ノイズ削減率", "98.5%", "高効率稼働中")
-with col2: st.metric("📨 処理アラーム数", f"{len(alarms) * 15 if alarms else 0}件", "抑制済")
-with col3: st.metric("🚨 要対応インシデント", f"{len([c for c in analysis_results if c['prob'] > 0.6])}件", "対処が必要")
-st.markdown("---")
-
-df_data = []
-# ★修正: スライス制限を撤廃 (全件表示)
-# 階層ロジックにより、重要なもの(Tier高)が先頭に来るため、大量にあっても問題ない
-for rank, cand in enumerate(analysis_results, 1):
-    status = "⚪ 監視中"
-    action = "👁️ 静観"
-    
-    if cand['prob'] > 0.8:
-        status = "🔴 危険 (根本原因)"
-        action = "🚀 自動修復が可能"
-    elif cand['prob'] > 0.6:
-        status = "🟡 警告 (被疑箇所)"
-        action = "🔍 詳細調査を推奨"
-    
-    if "Network/Unreachable" in cand['type'] or "Network/Secondary" in cand['type']:
-        status = "⚫ 応答なし (上位障害)"
-        action = "⛔ 対応不要 (上位復旧待ち)"
-
-    candidate_text = f"デバイス: {cand['id']} / 原因: {cand['label']}"
-    if cand.get('verification_log'):
-        candidate_text += " [🔍 Active Probe: 応答なし]"
-    
-    # デバッグ用にTierを表示（本番では消しても良い）
-    # candidate_text += f" (Tier: {cand.get('tier')})"
-
-    df_data.append({
-        "順位": rank,
-        "ステータス": status,
-        "根本原因候補": candidate_text,
-        "リスクスコア": cand['prob'],
-        "推奨アクション": action,
-        "ID": cand['id'],
-        "Type": cand['type']
-    })
-
-df = pd.DataFrame(df_data)
-st.info("💡 ヒント: インシデントの行をクリックすると、右側に詳細分析と復旧プランが表示されます。")
-
-event = st.dataframe(
-    df,
-    column_order=["順位", "ステータス", "根本原因候補", "リスクスコア", "推奨アクション"],
-    column_config={
-        "リスクスコア": st.column_config.ProgressColumn("リスクスコア (0-1.0)", format="%.2f", min_value=0, max_value=1),
-    },
-    use_container_width=True,
-    hide_index=True,
-    selection_mode="single-row",
-    on_select="rerun"
-)
-
-if len(event.selection.rows) > 0:
-    idx = event.selection.rows[0]
-    sel_row = df.iloc[idx]
-    for res in analysis_results:
-        if res['id'] == sel_row['ID'] and res['type'] == sel_row['Type']:
-            selected_incident_candidate = res
-            break
-else:
-    selected_incident_candidate = analysis_results[0] if analysis_results else None
-
-
-# 4. 画面分割
-col_map, col_chat = st.columns([1.2, 1])
-
-# === 左カラム: トポロジーと診断 ===
-with col_map:
-    st.subheader("🌐 Network Topology")
-    
-    current_root_node = None
-    current_severity = "WARNING"
-    
-    if selected_incident_candidate and selected_incident_candidate["prob"] > 0.6:
-        current_root_node = TOPOLOGY.get(selected_incident_candidate["id"])
-        if "Hardware/Physical" in selected_incident_candidate["type"] or "Critical" in selected_incident_candidate["type"] or "Silent" in selected_incident_candidate["type"]:
-            current_severity = "CRITICAL"
+# app.pyからの呼び出し名に合わせてクラス名をLogicalRCAに変更
+class LogicalRCA:
+    def __init__(self, topology, config_dir: str = "./configs"):
+        """
+        LogicalRCA (旧 InferenceEngine) の初期化
+        :param topology: トポロジー辞書オブジェクト または ファイルパス (str)
+        :param config_dir: コンフィグファイルが格納されているディレクトリ (デフォルト: ./configs)
+        """
+        # topologyが文字列（ファイルパス）の場合はファイルから読み込み
+        if isinstance(topology, str):
+            self.topology = self._load_topology(topology)
+        # 辞書の場合はそのまま使用
+        elif isinstance(topology, dict):
+            self.topology = topology
         else:
-            current_severity = "WARNING"
-
-    elif target_device_id:
-        current_root_node = TOPOLOGY.get(target_device_id)
-        current_severity = root_severity
-
-    st.graphviz_chart(render_topology(alarms, analysis_results), use_container_width=True)
-
-    st.markdown("---")
-    st.subheader("🛠️ Auto-Diagnostics")
-    
-    if st.button("🚀 診断実行 (Run Diagnostics)", type="primary"):
+            raise ValueError("topology must be either a file path (str) or a dictionary")
+        
+        self.config_dir = config_dir
+        
+        # Google Generative AIの設定
+        api_key = os.environ.get("GOOGLE_API_KEY")
         if not api_key:
-            st.error("API Key Required")
-        else:
-            with st.status("Agent Operating...", expanded=True) as status:
-                st.write("🔌 Connecting to device...")
-                target_node_obj = TOPOLOGY.get(target_device_id) if target_device_id else None
-                
-                res = run_diagnostic_simulation(selected_scenario, target_node_obj, api_key)
-                st.session_state.live_result = res
-                
-                if res["status"] == "SUCCESS":
-                    st.write("✅ Log Acquired & Sanitized.")
-                    status.update(label="Diagnostics Complete!", state="complete", expanded=False)
-                    log_content = res.get('sanitized_log', "")
-                    verification = verify_log_content(log_content)
-                    st.session_state.verification_result = verification
-                    st.session_state.trigger_analysis = True
-                elif res["status"] == "SKIPPED":
-                    status.update(label="No Action Required", state="complete")
-                else:
-                    st.write("❌ Connection Failed.")
-                    status.update(label="Diagnostics Failed", state="error")
-            st.rerun()
-
-    if st.session_state.live_result:
-        res = st.session_state.live_result
-        if res["status"] == "SUCCESS":
-            st.markdown("#### 📄 Diagnostic Results")
-            with st.container(border=True):
-                if selected_incident_candidate and selected_incident_candidate.get("verification_log"):
-                    st.caption("🤖 Active Probe / Verification Log")
-                    st.code(selected_incident_candidate["verification_log"], language="text")
-                    st.divider()
-
-                if st.session_state.verification_result:
-                    v = st.session_state.verification_result
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Ping Status", v.get('ping_status'))
-                    c2.metric("Interface", v.get('interface_status'))
-                    c3.metric("Hardware", v.get('hardware_status'))
-                
-                st.divider()
-                st.caption("🔒 Raw Logs (Sanitized)")
-                st.code(res["sanitized_log"], language="text")
-        elif res["status"] == "ERROR":
-            st.error(f"診断エラー: {res.get('error')}")
-
-# === 右カラム: 分析レポート ===
-with col_chat:
-    st.subheader("📝 AI Analyst Report")
-    
-    if selected_incident_candidate:
-        cand = selected_incident_candidate
+            # APIキーがない場合はエラーログを出力しつつ、動作を継続するか例外を投げる
+            # ここでは明確に例外とする
+            raise ValueError("GOOGLE_API_KEY environment variable is not set.")
         
-        # --- A. 状況報告 (Situation Report) ---
-        if "generated_report" not in st.session_state or st.session_state.generated_report is None:
-            st.info(f"インシデント選択中: **{cand['id']}** ({cand['label']})")
-            
-            if api_key and selected_scenario != "正常稼働":
-                if st.button("📝 詳細レポートを作成 (Generate Report)"):
-                    
-                    report_container = st.empty()
-                    target_conf = load_config_by_id(cand['id'])
-                    
-                    genai.configure(api_key=api_key)
-                    model = genai.GenerativeModel("gemma-3-12b-it")
-                    
-                    verification_context = cand.get("verification_log", "特になし")
-                    
-                    prompt = f"""
-                    あなたはネットワーク運用監視のプロフェッショナルです。
-                    以下の障害インシデントについて、顧客向けの「詳細な状況報告レポート」を作成してください。
-                    
-                    【入力情報】
-                    - 発生シナリオ: {selected_scenario}
-                    - 根本原因候補: {cand['id']} ({cand['label']})
-                    - リスクスコア: {cand['prob']*100:.0f}
-                    
-                    【★重要: AIによる能動的診断結果 (Reasoning)】
-                    システムはアラームだけでなく、以下の能動的な確認を行いました。この内容を「対応」や「特定根拠」に含めてください。
-                    {verification_context}
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel('gemini-1.5-flash')
 
-                    - 対象機器Config: 
-                    {target_conf[:1500]} (抜粋)
+    def _load_topology(self, path: str) -> Dict:
+        """JSONファイルからトポロジー情報を読み込む"""
+        if not os.path.exists(path):
+            return {}
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
 
-                    【重要: 出力形式】
-                    1. HTMLタグ(brなど)は絶対に使用しないでください。改行はMarkdownの標準的な空行（エンター2回）で行ってください。
-                    2. 見出し（###）の前後には必ず空行を入れてください。
-                    
-                    構成:
-                    ### 状況報告：{cand['id']}
-                    
-                    **1. 障害概要**
-                    (概要記述)
-                    
-                    **2. 影響**
-                    (影響記述)
-                    
-                    **3. 詳細情報**
-                    (機器情報など)
-                    
-                    **4. 対応と特定根拠**
-                    (★ここに能動的診断の結果を反映して記述)
-                    
-                    **5. 今後の対応**
-                    (今後)
-                    """
-                    
-                    try:
-                        response = generate_content_with_retry(model, prompt, stream=True)
-                        full_text = ""
-                        for chunk in response:
-                            if chunk.candidates[0].finish_reason == 1: 
-                                pass 
-                            elif chunk.candidates[0].finish_reason == 3: 
-                                full_text = "⚠️ コンテンツが安全フィルターによりブロックされました。別のシナリオを試してください。"
-                                break
-                            else:
-                                full_text += chunk.text
-                                report_container.markdown(full_text)
-                        
-                        if not full_text: full_text = "レポート生成に失敗しました（空の応答）。"
-                        st.session_state.generated_report = full_text
-                        st.session_state.last_report_cand_id = cand['id']
-                        
-                    except Exception as e:
-                        err_msg = f"Report Generation Error: {str(e)}"
-                        st.session_state.generated_report = err_msg
-                        st.error("現在、AIモデルが混雑しています (503 Error)。時間を置いて再度お試しください。")
-        else:
-            st.markdown(st.session_state.generated_report)
-            if st.button("🔄 レポート再作成"):
-                st.session_state.generated_report = None
-                st.rerun()
+    def _read_config(self, device_id: str) -> str:
+        """デバイスIDに対応するコンフィグファイルを読み込む"""
+        config_path = os.path.join(self.config_dir, f"{device_id}.txt")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    return f.read()
+            except Exception as e:
+                return f"Error reading config: {str(e)}"
+        return "Config file not found."
 
-    # --- B. 自動修復 & チャット ---
-    st.markdown("---")
-    st.subheader("🤖 Remediation & Chat")
+    def _sanitize_text(self, text: str) -> str:
+        """機密情報のサニタイズ処理"""
+        # パスワード系 (Cisco/Junos)
+        text = re.sub(r'(encrypted-password\s+)"[^"]+"', r'\1"********"', text)
+        text = re.sub(r'(password|secret)\s+(\d)\s+\S+', r'\1 \2 ********', text)
+        text = re.sub(r'(username\s+\S+\s+secret)\s+\d\s+\S+', r'\1 5 ********', text)
+        # SNMP Community
+        text = re.sub(r'(snmp-server community)\s+\S+', r'\1 ********', text)
+        return text
 
-    if selected_incident_candidate and selected_incident_candidate["prob"] > 0.6:
-        st.markdown(f"""
-        <div style="background-color:#e8f5e9;padding:10px;border-radius:5px;border:1px solid #4caf50;color:#2e7d32;margin-bottom:10px;">
-            <strong>✅ AI Analysis Completed</strong><br>
-            特定された原因 <b>{selected_incident_candidate['id']}</b> に対する復旧手順が利用可能です。<br>
-            (リスクスコア: <span style="font-size:1.2em;font-weight:bold;">{selected_incident_candidate['prob']*100:.0f}</span>)
-        </div>
-        """, unsafe_allow_html=True)
-
-        if "remediation_plan" not in st.session_state:
-            if st.button("✨ 修復プランを作成 (Generate Fix)"):
-                 if not api_key: st.error("API Key Required")
-                 else:
-                    with st.spinner("Generating plan..."):
-                        t_node = TOPOLOGY.get(selected_incident_candidate["id"])
-                        plan_md = generate_remediation_commands(
-                            selected_scenario, 
-                            f"Identified Root Cause: {selected_incident_candidate['label']}", 
-                            t_node, api_key
-                        )
-                        st.session_state.remediation_plan = plan_md
-                        st.rerun()
+    def analyze(self, alarms: List) -> List[Dict[str, Any]]:
+        """
+        アラームリストを分析して根本原因候補を返す
+        app.pyから呼び出される主要なメソッド
         
-        if "remediation_plan" in st.session_state:
-            with st.container(border=True):
-                st.info("AI Generated Recovery Procedure")
-                st.markdown(st.session_state.remediation_plan)
+        :param alarms: Alarmオブジェクトのリスト
+        :return: 分析結果のリスト（辞書形式）
+        """
+        results = []
+        
+        if not alarms:
+            return [{
+                "id": "SYSTEM",
+                "label": "No alerts detected",
+                "prob": 0.0,
+                "type": "Normal",
+                "tier": 0
+            }]
+        
+        # 各アラームに対して分析を実行
+        for alarm in alarms:
+            device_id = alarm.device_id
+            alert_messages = [alarm.message]
             
-            col_exec1, col_exec2 = st.columns(2)
+            # LLMによる冗長性深度分析
+            analysis = self.analyze_redundancy_depth(device_id, alert_messages)
             
-            with col_exec1:
-                if st.button("🚀 修復実行 (Execute)", type="primary"):
-                    if not api_key:
-                        st.error("API Key Required")
-                    else:
-                        with st.status("Autonomic Remediation in progress...", expanded=True) as status:
-                            st.write("⚙️ Applying Configuration...")
-                            time.sleep(1.5) 
-                            
-                            st.write("🔎 Running Verification Commands...")
-                            target_node_obj = TOPOLOGY.get(selected_incident_candidate["id"])
-                            verification_log = generate_fake_log_by_ai("正常稼働", target_node_obj, api_key)
-                            st.session_state.verification_log = verification_log
-                            
-                            st.write("✅ Verification Completed.")
-                            status.update(label="Process Finished", state="complete", expanded=False)
-                        
-                        st.success("Remediation Process Finished.")
-
-            with col_exec2:
-                 if st.button("キャンセル"):
-                    del st.session_state.remediation_plan
-                    st.session_state.verification_log = None
-                    st.rerun()
+            # 結果を整形
+            prob = 0.5  # デフォルト
+            if analysis["status"] == HealthStatus.CRITICAL:
+                prob = 0.9
+            elif analysis["status"] == HealthStatus.WARNING:
+                prob = 0.7
+            else:
+                prob = 0.3
             
-            if st.session_state.get("verification_log"):
-                st.markdown("#### 🔎 Post-Fix Verification Logs")
-                st.code(st.session_state.verification_log, language="text")
-                
-                is_success = "up" in st.session_state.verification_log.lower() or "ok" in st.session_state.verification_log.lower()
-                
-                if is_success:
-                    st.balloons()
-                    st.success("✅ System Recovered Successfully!")
-                else:
-                    st.warning("⚠️ Verification indicates potential issues. Please check manually.")
+            results.append({
+                "id": device_id,
+                "label": alarm.message,
+                "prob": prob,
+                "type": analysis["impact_type"],
+                "tier": 1 if prob > 0.6 else 2,
+                "reason": analysis["reason"]
+            })
+        
+        # 確率順にソート
+        results.sort(key=lambda x: x["prob"], reverse=True)
+        
+        return results
 
-                if st.button("デモを終了してリセット"):
-                    del st.session_state.remediation_plan
-                    st.session_state.verification_log = None
-                    st.session_state.current_scenario = "正常稼働"
-                    st.rerun()
-    else:
-        if selected_incident_candidate:
-            score = selected_incident_candidate['prob'] * 100
-            st.warning(f"""
-            ⚠️ **自動修復はロックされています**
-            現在選択されているインシデントのリスクスコアは **{score:.0f}** です。
-            誤操作防止のため、スコアが 60 以上の時のみ自動修復ボタンが有効化されます。
-            """)
+    def analyze_redundancy_depth(self, device_id: str, alerts: List[str]) -> Dict[str, Any]:
+        """
+        LLMを使用して冗長性深度を判定する
+        """
+        if not alerts:
+            return {
+                "status": HealthStatus.NORMAL,
+                "reason": "No active alerts detected.",
+                "impact_type": "NONE"
+            }
 
-    # チャット (常時表示)
-    with st.expander("💬 Chat with AI Agent", expanded=False):
-        if st.session_state.chat_session is None and api_key and selected_scenario != "正常稼働":
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel("gemma-3-12b-it")
-            st.session_state.chat_session = model.start_chat(history=[])
+        device_info = self.topology.get(device_id, {})
+        raw_config = self._read_config(device_id)
+        
+        # TOPOLOGYが辞書の場合、metadataの取得方法を調整
+        if hasattr(device_info, 'metadata'):
+            metadata = device_info.metadata
+        elif isinstance(device_info, dict):
+            metadata = device_info.get('metadata', {})
+        else:
+            metadata = {}
 
-        for msg in st.session_state.messages:
-            with st.chat_message(msg["role"]): st.markdown(msg["content"])
+        # サニタイズ
+        safe_config = self._sanitize_text(raw_config)
+        safe_alerts = [self._sanitize_text(a) for a in alerts]
 
-        if prompt := st.chat_input("Ask details..."):
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            with st.chat_message("user"): st.markdown(prompt)
-            if st.session_state.chat_session:
-                with st.chat_message("assistant"):
-                    with st.spinner("Thinking..."):
-                        res_container = st.empty()
-                        response = generate_content_with_retry(st.session_state.chat_session.model, prompt, stream=True)
-                        if response:
-                            full_response = ""
-                            for chunk in response:
-                                full_response += chunk.text
-                                res_container.markdown(full_response)
-                            st.session_state.messages.append({"role": "assistant", "content": full_response})
-                        else:
-                            st.error("AIからの応答がありませんでした。")
+        prompt = f"""
+あなたはネットワーク運用のエキスパートAIです。
+以下の情報に基づき、現在発生しているアラートが「サービス停止(CRITICAL)」を引き起こしているか、
+それとも「冗長機能によりサービスは維持されている(WARNING)」状態かを判定してください。
 
-# ベイズ更新トリガー (診断後)
-if st.session_state.trigger_analysis and st.session_state.live_result:
-    if st.session_state.verification_result:
-        pass
-    st.session_state.trigger_analysis = False
-    st.rerun()
+### 対象デバイス
+- **Device ID**: {device_id}
+- **Metadata**: {json.dumps(metadata)}
+
+### 設定ファイル (Config - Sanitized)
+```text
+{safe_config}
+```
+
+### 発生中のアラートリスト
+{json.dumps(safe_alerts)}
+
+### 判定ルール (Thinking Process)
+１．電源(PSU)障害の判定:
+  ・デバイスが複数のPSUを持っていると推測され、かつ「全て」ではなく「一部」のPSUのみがFailしている場合。
+  ・判定: WARNING (理由: Redundancy Lost - 片系運転中)
+  ・全てのPSUがFail、または単一PSUデバイスのFailの場合。
+  ・判定: CRITICAL (理由: Power Outage)
+２．インターフェース/LAG障害の判定:
+　・Configを確認し、Downしている物理インターフェースが LAG (Port-Channel / ae / Bond) のメンバーか確認してください。
+　・親となる論理インターフェース(Port-Channel Xなど)自体のアラートが出ていなければ、親はUpしているとみなします。
+　・メンバーのみのDownの場合。
+　・判定: WARNING (理由: Degraded - 帯域縮退)
+　・LAG非構成ポートのDown、または親LAG自体のDownの場合。
+　・判定: CRITICAL (理由: Link Down - Service Impacting)
+３．その他:
+　・上記に当てはまらない不明なエラーや、CPU高負荷などは内容に応じて判断してください。
+
+### 出力フォーマット
+以下のJSON形式のみを出力してください。Markdownのコードブロック(```json ...)は含めないでください。
+{{
+  "status": "STATUS_STRING",
+  "reason": "判定理由を簡潔に記述",
+  "impact_type": "IMPACT_STRING"
+}}
+
+- status: "NORMAL", "WARNING", "CRITICAL" のいずれか
+- impact_type: "NONE", "DEGRADED", "REDUNDANCY_LOST", "OUTAGE", "UNKNOWN" のいずれか
+"""
+
+        try:
+            # LLMへの問い合わせ
+            response = self.model.generate_content(
+                prompt,
+                generation_config={"response_mime_type": "application/json"}
+            )
+            
+            # レスポンス解析
+            response_text = response.text.strip()
+            if response_text.startswith("```json"):
+                response_text = response_text[7:]
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]
+
+            result_json = json.loads(response_text)
+            
+            status_str = result_json.get("status", "CRITICAL").upper()
+            if status_str in ["GREEN", "NORMAL"]:
+                health_status = HealthStatus.NORMAL
+            elif status_str in ["YELLOW", "WARNING"]:
+                health_status = HealthStatus.WARNING
+            else:
+                health_status = HealthStatus.CRITICAL
+
+            return {
+                "status": health_status,
+                "reason": result_json.get("reason", "AI provided no reason"),
+                "impact_type": result_json.get("impact_type", "UNKNOWN")
+            }
+
+        except Exception as e:
+            print(f"[!] AI Inference Error: {e}")
+            return {
+                "status": HealthStatus.CRITICAL,
+                "reason": f"AI Analysis Failed: {str(e)}",
+                "impact_type": "AI_ERROR"
+            }
+
+
+if __name__ == "__main__":
+    # テスト用設定
+    TEST_TOPOLOGY = "topology.json"
+    TEST_CONFIG_DIR = "./configs"
+
+    # 簡易的なファイル生成（ディレクトリが存在しない場合のみ作成）
+    if not os.path.exists(TEST_CONFIG_DIR):
+        os.makedirs(TEST_CONFIG_DIR)
+
+    try:
+        # クラス名をLogicalRCAに変更して初期化
+        engine = LogicalRCA(TEST_TOPOLOGY, TEST_CONFIG_DIR)
+        
+        print("--- AI Redundancy Analysis Test (LogicalRCA) ---")
+        test_device = "WAN_ROUTER_01"
+        test_alerts = ["Environment: PSU 1 Status Failed", "Environment: PSU 2 Status OK"]
+        
+        result = engine.analyze_redundancy_depth(test_device, test_alerts)
+        print(f"Result: {result['status'].value} ({result['impact_type']})")
+        print(f"Reason: {result['reason']}")
+
+    except ValueError as e:
+        print(f"Config Error: {e}")
+    except Exception as e:
+        print(f"Execution Error: {e}")
