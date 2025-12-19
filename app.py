@@ -368,6 +368,7 @@ if st.session_state.current_scenario != selected_scenario:
     # シナリオ変更時は復旧フラグもクリア（未修復なのにOKになるのを防ぐ）
     st.session_state.recovered_devices = {}
     st.session_state.recovered_scenario_map = {}
+    st.session_state["_balloons_once_key"] = None
     st.session_state.messages = []      
     st.session_state.chat_session = None 
     st.session_state.live_result = None 
@@ -776,7 +777,11 @@ with col_chat:
                     st.session_state.recovered_scenario_map = st.session_state.get("recovered_scenario_map") or {}
                     st.session_state.recovered_devices[target_device_id] = True
                     st.session_state.recovered_scenario_map[target_device_id] = selected_scenario
-                    st.balloons()
+                    # ✅ 風船は「Execute成功の瞬間だけ1回」
+                    _balloons_key = f"{target_device_id}|{selected_scenario}"
+                    if st.session_state.get("_balloons_once_key") != _balloons_key:
+                        st.balloons()
+                        st.session_state["_balloons_once_key"] = _balloons_key
                     st.success("✅ System Recovered Successfully!")
                 else:
                     st.warning("⚠️ Verification indicates potential issues. Please check manually.")
@@ -785,6 +790,7 @@ with col_chat:
                     del st.session_state.remediation_plan
                     st.session_state.verification_log = None
                     st.session_state.current_scenario = "正常稼働"
+                    st.session_state["_balloons_once_key"] = None
                     st.rerun()
     else:
         if selected_incident_candidate:
@@ -815,19 +821,26 @@ with st.sidebar:
                 st.caption(f"対象機器: {_chat_target_id}   Vendor: {_vendor}   OS: {_os}   Model: {_model}")
     
             # クイック質問（入力欄は変えず、コピペ用に提示）
-            q1, q2, q3 = st.columns(3)
+            # クイック質問（縦スペース節約：プルダウン + 1ボタン）
             if "chat_quick_text" not in st.session_state:
                 st.session_state.chat_quick_text = ""
-    
-            with q1:
-                if st.button("設定バックアップ", use_container_width=True):
-                    st.session_state.chat_quick_text = "この機器で、現在の設定を安全にバックアップする手順とコマンド例を教えてください。"
-            with q2:
-                if st.button("ロールバック", use_container_width=True):
-                    st.session_state.chat_quick_text = "この機器で、変更をロールバックする代表的な手順（候補）と注意点を教えてください。"
-            with q3:
-                if st.button("確認コマンド", use_container_width=True):
-                    st.session_state.chat_quick_text = "今回の症状を切り分けるために、まず実行すべき確認コマンド（show/diagnostic）を優先度順に教えてください。"
+            if "chat_quick_select" not in st.session_state:
+                st.session_state.chat_quick_select = "（選択）"
+
+            st.caption("クイック質問（コピーして貼り付け）")
+            st.selectbox(
+                label="",
+                options=["（選択）", "設定バックアップ", "ロールバック", "確認コマンド"],
+                key="chat_quick_select",
+            )
+
+            if st.button("クイック質問（入力欄に挿入）", use_container_width=True):
+                _m = {
+                    "設定バックアップ": "この機器で、現在の設定を安全にバックアップする手順とコマンド例を教えてください。",
+                    "ロールバック": "この機器で、変更をロールバックする代表的な手順（候補）と注意点を教えてください。",
+                    "確認コマンド": "今回の症状を切り分けるために、まず実行すべき確認コマンド（show/diagnostic）を優先度順に教えてください。",
+                }
+                st.session_state.chat_quick_text = _m.get(st.session_state.chat_quick_select, "")
     
             if st.session_state.chat_quick_text:
                 st.info("クイック質問（コピーして貼り付け）")
