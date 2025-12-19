@@ -162,7 +162,7 @@ def run_diagnostic_simulation_no_llm(selected_scenario, target_node_obj):
     recovered_map = st.session_state.get("recovered_scenario_map") or {}
 
     if recovered_devices.get(device_id) and recovered_map.get(device_id) == selected_scenario:
-        # "復旧後"の疑似ログ（成功）
+        # “復旧後”の疑似ログ（成功）
         if "FW" in selected_scenario:
             lines += [
                 "show chassis cluster status",
@@ -202,7 +202,7 @@ def run_diagnostic_simulation_no_llm(selected_scenario, target_node_obj):
             "device_id": device_id,
         }
 
-    # "障害中"の疑似ログ（現状維持）
+    # “障害中”の疑似ログ（現状維持）
     if "WAN全回線断" in selected_scenario or "[WAN]" in selected_scenario:
         lines += [
             "show ip interface brief",
@@ -347,9 +347,9 @@ if "current_scenario" not in st.session_state:
     st.session_state.current_scenario = "正常稼働"
 
 # 変数初期化
-for key in ["live_result", "messages", "chat_session", "trigger_analysis", "verification_result", "generated_report", "verification_log", "last_report_cand_id", "logic_engine", "recovered_devices", "recovered_scenario_map", "balloons_shown"]:
+for key in ["live_result", "messages", "chat_session", "trigger_analysis", "verification_result", "generated_report", "verification_log", "last_report_cand_id", "logic_engine", "recovered_devices", "recovered_scenario_map"]:
     if key not in st.session_state:
-        st.session_state[key] = None if key != "messages" and key != "trigger_analysis" and key != "balloons_shown" else ([] if key == "messages" else False)
+        st.session_state[key] = None if key != "messages" and key != "trigger_analysis" else ([] if key == "messages" else False)
 
 
 # 復旧状態（デモ用）
@@ -376,7 +376,6 @@ if st.session_state.current_scenario != selected_scenario:
     st.session_state.generated_report = None
     st.session_state.verification_log = None 
     st.session_state.last_report_cand_id = None
-    st.session_state.balloons_shown = False  # バルーンフラグもリセット
     if "remediation_plan" in st.session_state: del st.session_state.remediation_plan
     st.rerun()
 
@@ -704,9 +703,7 @@ with col_chat:
 
                     st.session_state.generated_report = full_text
         else:
-            # 既存レポートをスクロール可能なコンテナで表示
-            with st.container(height=400, border=True):
-                st.markdown(st.session_state.generated_report)
+            st.markdown(st.session_state.generated_report)
             if st.button("🔄 レポート再作成"):
                 st.session_state.generated_report = None
                 st.rerun()
@@ -736,8 +733,7 @@ with col_chat:
                      st.rerun()
         
         if "remediation_plan" in st.session_state:
-            # Remediation planをスクロール可能なコンテナで表示
-            with st.container(height=300, border=True):
+            with st.container(border=True):
                 st.info("AI Generated Recovery Procedure")
                 st.markdown(st.session_state.remediation_plan)
             
@@ -780,12 +776,7 @@ with col_chat:
                     st.session_state.recovered_scenario_map = st.session_state.get("recovered_scenario_map") or {}
                     st.session_state.recovered_devices[target_device_id] = True
                     st.session_state.recovered_scenario_map[target_device_id] = selected_scenario
-                    
-                    # バルーンは一度だけ表示
-                    if not st.session_state.balloons_shown:
-                        st.balloons()
-                        st.session_state.balloons_shown = True
-                    
+                    st.balloons()
                     st.success("✅ System Recovered Successfully!")
                 else:
                     st.warning("⚠️ Verification indicates potential issues. Please check manually.")
@@ -794,7 +785,6 @@ with col_chat:
                     del st.session_state.remediation_plan
                     st.session_state.verification_log = None
                     st.session_state.current_scenario = "正常稼働"
-                    st.session_state.balloons_shown = False  # バルーンフラグもリセット
                     st.rerun()
     else:
         if selected_incident_candidate:
@@ -805,7 +795,7 @@ with col_chat:
             誤操作防止のため、スコアが 60 以上の時のみ自動修復ボタンが有効化されます。
             """)
 
-    # チャット (常時表示) - オプション3で改善
+    # チャット (常時表示)
     with st.expander("💬 Chat with AI Agent", expanded=False):
         # 対象CIのサマリ（表示のみ、UXは崩さず最小）
         _chat_target_id = ""
@@ -842,59 +832,35 @@ with col_chat:
             st.info("クイック質問（コピーして貼り付け）")
             st.code(st.session_state.chat_quick_text)
 
-        if st.session_state.chat_session is None and api_key:
+        if st.session_state.chat_session is None and api_key and selected_scenario != "正常稼働":
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel("gemma-3-12b-it")
             st.session_state.chat_session = model.start_chat(history=[])
 
-        # タブでレイアウトを整理
-        tab1, tab2 = st.tabs(["💬 会話", "📝 履歴"])
-        
-        with tab1:
-            # 最新の応答のみを目立たせる
-            if st.session_state.messages:
-                last_msg = st.session_state.messages[-1]
-                if last_msg["role"] == "assistant":
-                    st.info("🤖 最新の回答")
-                    with st.container(height=300):
-                        st.markdown(last_msg["content"])
-            
-            # 入力欄を上部に配置
-            st.markdown("---")
-            prompt = st.text_area(
-                "質問を入力してください:",
-                height=70,
-                placeholder="Ctrl+Enter または 送信ボタンで送信",
-                key="chat_textarea"
-            )
-            
-            col1, col2, col3 = st.columns([3, 1, 1])
-            with col2:
-                send_button = st.button("送信", type="primary", use_container_width=True)
-            with col3:
-                if st.button("クリア"):
-                    st.session_state.messages = []
-                    st.rerun()
-            
-            # 送信処理
-            if send_button and prompt:
-                st.session_state.messages.append({"role": "user", "content": prompt})
-                
-                if st.session_state.chat_session:
-                    # CI-aware prompt（CI/Config をフル活用）
-                    target_id = ""
-                    try:
-                        if selected_incident_candidate:
-                            target_id = selected_incident_candidate.get("id", "") or ""
-                    except Exception:
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]): st.markdown(msg["content"])
+
+        if prompt := st.chat_input("Ask details..."):
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"): st.markdown(prompt)
+            if st.session_state.chat_session:
+                with st.chat_message("assistant"):
+                    with st.spinner("Thinking..."):
+                        res_container = st.empty()
+                        # CI-aware prompt（CI/Config をフル活用）
                         target_id = ""
-                    if not target_id:
                         try:
-                            target_id = target_device_id
+                            if selected_incident_candidate:
+                                target_id = selected_incident_candidate.get("id", "") or ""
                         except Exception:
                             target_id = ""
-                    ci = _build_ci_context_for_chat(target_id) if target_id else {}
-                    ci_prompt = f"""あなたはネットワーク運用（NOC/SRE）の実務者です。
+                        if not target_id:
+                            try:
+                                target_id = target_device_id
+                            except Exception:
+                                target_id = ""
+                        ci = _build_ci_context_for_chat(target_id) if target_id else {}
+                        ci_prompt = f"""あなたはネットワーク運用（NOC/SRE）の実務者です。
 次の CI 情報と Config 抜粋を必ず参照して、具体的に回答してください。一般論だけで終わらせないでください。
 
 【CI (JSON)】
@@ -908,33 +874,21 @@ with col_chat:
 - 追加確認が必要なら、質問は最小限（1〜2点）に絞る
 - 不明な前提は推測せず「CIに無いので確認が必要」と明記する
 """
-                    
-                    with st.spinner("AI が回答を生成中..."):
-                        try:
-                            response = generate_content_with_retry(st.session_state.chat_session.model, ci_prompt, stream=False)
-                            if response:
-                                full_response = response.text if hasattr(response, "text") else str(response)
-                                if not full_response.strip():
-                                    full_response = "AI応答が空でした（CIは渡しましたが出力が生成されませんでした）。"
-                                st.session_state.messages.append({"role": "assistant", "content": full_response})
-                            else:
-                                st.error("AIからの応答がありませんでした。")
-                        except Exception as e:
-                            st.error(f"エラーが発生しました: {e}")
-                    st.rerun()
-        
-        with tab2:
-            # スクロール可能な履歴表示
-            if st.session_state.messages:
-                history_container = st.container(height=400)
-                with history_container:
-                    for i, msg in enumerate(st.session_state.messages):
-                        icon = "🤖" if msg["role"] == "assistant" else "👤"
-                        with st.container(border=True):
-                            st.markdown(f"{icon} **{msg['role'].upper()}** (メッセージ {i+1})")
-                            st.markdown(msg["content"])
-            else:
-                st.info("会話履歴はまだありません。")
+
+                        response = generate_content_with_retry(st.session_state.chat_session.model, ci_prompt, stream=True)
+                        if response:
+                            full_response = ""
+                            for chunk in response:
+                                piece = _safe_chunk_text(chunk)
+                                if not piece:
+                                    continue
+                                full_response += piece
+                                res_container.markdown(full_response)
+                            if not full_response.strip():
+                                full_response = "AI応答が空でした（CIは渡しましたが出力が生成されませんでした）。"
+                            st.session_state.messages.append({"role": "assistant", "content": full_response})
+                        else:
+                            st.error("AIからの応答がありませんでした。")
 
 # ベイズ更新トリガー (診断後)
 if st.session_state.trigger_analysis and st.session_state.live_result:
