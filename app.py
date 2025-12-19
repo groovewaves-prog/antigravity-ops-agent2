@@ -803,7 +803,7 @@ with col_chat:
 
 with st.sidebar:
     # チャット (常時表示)
-        with st.expander("💬 Chat with AI Agent", expanded=False):
+    with st.expander("💬 Chat with AI Agent", expanded=False):
             # 対象CIのサマリ（表示のみ、UXは崩さず最小）
             _chat_target_id = ""
             try:
@@ -812,84 +812,128 @@ with st.sidebar:
             except Exception:
                 _chat_target_id = ""
             if not _chat_target_id:
-                _chat_target_id = target_device_id if 'target_device_id' in globals() else ""
+                _chat_target_id = st.session_state.get("target_device_id", "") or ""
+            if not _chat_target_id:
+                _chat_target_id = "SYSTEM"
+
             _chat_ci = _build_ci_context_for_chat(_chat_target_id) if _chat_target_id else {}
-            if _chat_ci:
-                _vendor = _chat_ci.get("vendor", "") or "Unknown"
-                _os = _chat_ci.get("os", "") or "Unknown"
-                _model = _chat_ci.get("model", "") or "Unknown"
-                st.caption(f"対象機器: {_chat_target_id}   Vendor: {_vendor}   OS: {_os}   Model: {_model}")
-    
-            # クイック質問（入力欄は変えず、コピペ用に提示）
-            # クイック質問（縦スペース節約：プルダウン + 1ボタン）
-            if "chat_quick_text" not in st.session_state:
-                st.session_state.chat_quick_text = ""
+            _vendor = (_chat_ci.get("vendor", "") or "Unknown")
+            _os = (_chat_ci.get("os", "") or "Unknown")
+            _model = (_chat_ci.get("model", "") or "Unknown")
+            st.caption(f"対象機器: {_chat_target_id}   Vendor: {_vendor}   OS: {_os}   Model: {_model}")
+
+            # クイック質問（サイドバー幅でも崩れないよう selectbox + 挿入）
             if "chat_quick_select" not in st.session_state:
                 st.session_state.chat_quick_select = "（選択）"
+            if "chat_draft" not in st.session_state:
+                st.session_state.chat_draft = ""
 
-            st.caption("クイック質問（コピーして貼り付け）")
+            quick_options = [
+                "（選択）",
+                "設定バックアップ: ローカル保存（推奨手順）",
+                "設定バックアップ: リモート転送（SCP/TFTP/FTP）",
+                "ロールバック: 直前変更の戻し方（候補）",
+                "ロールバック: 置換/復元（replace / copy back）",
+                "確認コマンド: まず実行すべきshow（優先度順）",
+                "確認コマンド: 復旧後の正常性確認（期待結果つき）",
+            ]
             st.selectbox(
-                label="",
-                options=["（選択）", "設定バックアップ", "ロールバック", "確認コマンド"],
+                "クイック質問テンプレ",
+                options=quick_options,
                 key="chat_quick_select",
+                label_visibility="collapsed",
             )
 
             if st.button("クイック質問（入力欄に挿入）", use_container_width=True):
                 _m = {
-                    "設定バックアップ": "この機器で、現在の設定を安全にバックアップする手順とコマンド例を教えてください。",
-                    "ロールバック": "この機器で、変更をロールバックする代表的な手順（候補）と注意点を教えてください。",
-                    "確認コマンド": "今回の症状を切り分けるために、まず実行すべき確認コマンド（show/diagnostic）を優先度順に教えてください。",
+                    "設定バックアップ: ローカル保存（推奨手順）":
+                        "この機器で、現在の設定を安全にバックアップする推奨手順（事前確認→保存→検証）とコマンド例を、CI(ベンダ/OS)前提で教えてください。",
+                    "設定バックアップ: リモート転送（SCP/TFTP/FTP）":
+                        "この機器で、running-config / startup-config をリモート（SCP/TFTP/FTP等）へ退避する方法を、前提条件（到達性/認証/VRF等）も含めて教えてください。",
+                    "ロールバック: 直前変更の戻し方（候補）":
+                        "この機器で、直前の変更を安全にロールバックする代表手順（候補）と注意点を、CI(ベンダ/OS)前提で教えてください。",
+                    "ロールバック: 置換/復元（replace / copy back）":
+                        "この機器で、バックアップした設定を使って置換/復元する手順（config replace / copy back等）を、失敗時の戻し方も含めて教えてください。",
+                    "確認コマンド: まず実行すべきshow（優先度順）":
+                        "今回の症状を切り分けるために、まず実行すべき確認コマンド（show/diagnostic）を優先度順に、期待結果（正常/異常の見分け）も添えて教えてください。",
+                    "確認コマンド: 復旧後の正常性確認（期待結果つき）":
+                        "復旧作業後の正常性確認として、最低限押さえる確認コマンドと期待結果（合否の判断基準）を、CI(ベンダ/OS)前提で教えてください。",
                 }
-                st.session_state.chat_quick_text = _m.get(st.session_state.chat_quick_select, "")
-    
-            if st.session_state.chat_quick_text:
-                st.info("クイック質問（コピーして貼り付け）")
-                st.code(st.session_state.chat_quick_text)
-    
-            if st.session_state.chat_session is None and api_key and selected_scenario != "正常稼働":
-                genai.configure(api_key=api_key)
-                model = genai.GenerativeModel("gemma-3-12b-it")
-                st.session_state.chat_session = model.start_chat(history=[])
-    
+                st.session_state.chat_draft = _m.get(st.session_state.chat_quick_select, st.session_state.chat_draft)
+
+            st.info("クイック質問は「挿入」→必要なら追記→送信してください。")
+
+            # チャットセッション初期化
+            if 'chat_session' not in st.session_state:
+                api_key = os.environ.get("GEMINI_API_KEY", "")
+                if api_key:
+                    genai.configure(api_key=api_key)
+                    model = genai.GenerativeModel("gemma-3-12b-it")
+                    st.session_state.chat_session = model.start_chat(history=[])
+                else:
+                    st.session_state.chat_session = None
+
+            # 履歴
             for msg in st.session_state.messages:
-                with st.chat_message(msg["role"]): st.markdown(msg["content"])
-    
-            if prompt := st.chat_input("Ask details..."):
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+
+            # サイドバー内では st.chat_input が不安定になりやすいため、text_area + send を採用（UX最小変更）
+            st.session_state.chat_draft = st.text_area(
+                "Ask details...",
+                value=st.session_state.chat_draft,
+                height=80,
+                label_visibility="collapsed",
+            )
+
+            col_send, col_clear = st.columns([1, 1])
+            with col_send:
+                send_clicked = st.button("送信", use_container_width=True)
+            with col_clear:
+                clear_clicked = st.button("クリア", use_container_width=True)
+
+            if clear_clicked:
+                st.session_state.chat_draft = ""
+
+            if send_clicked and st.session_state.chat_draft.strip():
+                prompt = st.session_state.chat_draft.strip()
+                st.session_state.chat_draft = ""
                 st.session_state.messages.append({"role": "user", "content": prompt})
-                with st.chat_message("user"): st.markdown(prompt)
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+
                 if st.session_state.chat_session:
                     with st.chat_message("assistant"):
                         with st.spinner("Thinking..."):
                             res_container = st.empty()
+
                             # CI-aware prompt（CI/Config をフル活用）
-                            target_id = ""
-                            try:
-                                if selected_incident_candidate:
-                                    target_id = selected_incident_candidate.get("id", "") or ""
-                            except Exception:
-                                target_id = ""
-                            if not target_id:
-                                try:
-                                    target_id = target_device_id
-                                except Exception:
-                                    target_id = ""
+                            target_id = _chat_target_id or ""
                             ci = _build_ci_context_for_chat(target_id) if target_id else {}
-                            ci_prompt = f"""あなたはネットワーク運用（NOC/SRE）の実務者です。
-    次の CI 情報と Config 抜粋を必ず参照して、具体的に回答してください。一般論だけで終わらせないでください。
-    
-    【CI (JSON)】
-    {json.dumps(ci, ensure_ascii=False, indent=2)}
-    
-    【ユーザーの質問】
-    {prompt}
-    
-    回答ルール:
-    - CI/Config に基づく具体手順・コマンド例を提示する
-    - 追加確認が必要なら、質問は最小限（1〜2点）に絞る
-    - 不明な前提は推測せず「CIに無いので確認が必要」と明記する
-    """
-    
-                            response = generate_content_with_retry(st.session_state.chat_session.model, ci_prompt, stream=True)
+
+                            ci_header = f"""
+あなたはネットワーク運用（NOC/SRE）の診断・復旧専用アシスタントです。
+次の CI 情報・Config 抜粋（あれば）を必ず参照して、機種・OS前提で具体的に答えてください。
+
+### CI (JSON)
+{json.dumps(ci, ensure_ascii=False, indent=2)}
+
+### ユーザーの質問
+{prompt}
+
+回答ルール:
+- 「機種やメーカーによって異なります」だけで終わらせない
+- このCIから妥当な方法を提示し、必要なら追加で確認すべき項目を最小で質問する
+- 可能な限りコマンド例と“期待結果（正常/異常の判定観点）”を付ける
+- 破壊的操作は必ず事前確認を入れる（最終判断は人）
+"""
+
+                            response = generate_content_with_retry(
+                                st.session_state.chat_session.model,
+                                ci_header,
+                                stream=True
+                            )
+
                             if response:
                                 full_response = ""
                                 for chunk in response:
@@ -903,7 +947,10 @@ with st.sidebar:
                                 st.session_state.messages.append({"role": "assistant", "content": full_response})
                             else:
                                 st.error("AIからの応答がありませんでした。")
-    
+                else:
+                    st.error("APIキー未設定のためAIチャットを利用できません。GEMINI_API_KEYを設定してください。")
+
+
 # ベイズ更新トリガー (診断後)
 if st.session_state.trigger_analysis and st.session_state.live_result:
     if st.session_state.verification_result:
