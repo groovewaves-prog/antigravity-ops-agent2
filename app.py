@@ -18,6 +18,21 @@ from verifier import verify_log_content, format_verification_report
 from inference_engine import LogicalRCA
 
 # --- ページ設定 ---
+
+
+# -----------------------------
+# Helpers (keep IF logic minimal)
+# -----------------------------
+import hashlib
+
+def _hash_text(s: str) -> str:
+    """Stable short hash for caching keys."""
+    if s is None:
+        s = ""
+    if not isinstance(s, str):
+        s = str(s)
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:12]
+
 st.set_page_config(page_title="Antigravity Autonomous", page_icon="⚡", layout="wide")
 
 # ==========================================
@@ -521,118 +536,71 @@ with col_map:
     st.markdown("---")
     st.subheader("🛠️ Auto-Diagnostics")
     if st.button("🚀 診断実行 (Run Diagnostics)", type="primary"):
-        if not api_key:
-            st.error("API Key Required")
-        else:
-            # 診断対象は「現在選択中のインシデント（右の行選択）」を優先
-            diag_device_id = None
-            if selected_incident_candidate:
-                diag_device_id = selected_incident_candidate.get("id")
-            if not diag_device_id:
-                diag_device_id = target_device_id
+        # NOTE: 疑似プローブ（LLMは呼びません）
+        # 診断対象は「現在選択中のインシデント（右の行選択）」を優先
+        diag_device_id = None
+        if selected_incident_candidate:
+            diag_device_id = selected_incident_candidate.get("id")
+        if not diag_device_id:
+            diag_device_id = target_device_id
 
-            target_node_obj = TOPOLOGY.get(diag_device_id) if diag_device_id else None
+        target_node_obj = TOPOLOGY.get(diag_device_id) if diag_device_id else None
 
-            with st.status("Agent Operating...", expanded=True) as status:
-                st.write(f"🔌 Connecting to device... [{diag_device_id}]")
-                res = run_diagnostic_simulation(selected_scenario, target_node_obj, api_key)
-                st.session_state.live_result = res
+        # トポロジーコンテキスト（親子）
+        parent_id = getattr(target_node_obj, "parent_id", None) if target_node_obj else None
+        children_ids = [
+            nid for nid, n in TOPOLOGY.items()
+            if getattr(n, "parent_id", None) == diag_device_id
+        ] if diag_device_id else []
 
-                if res.get("status") == "SUCCESS":
-                    st.write("✅ Log Acquired & Sanitized.")
-                    status.update(label="Diagnostics Complete!", state="complete", expanded=False)
+        # Config 取得（あれば）
+        target_conf = ""
+        if diag_device_id:
+            try:
+                target_conf = load_config_by_id(diag_device_id) or ""
+            except Exception:
+                target_conf = ""
 
-                    log_content = res.get("sanitized_log", "") or ""
-                    # 後段（レポート/修復プラン）に渡すために保持
-                    if diag_device_id:
-                        st.session_state.active_probe_logs[diag_device_id] = log_content
+        # Alarm 取得（あれば）
+        device_alarms = []
+        try:
+            device_alarms = [a for a in alarms if a.get("device_id") == diag_device_id]
+        except Exception:
+            device_alarms = []
 
-                    verification = verify_log_content(log_content)
-                    st.session_state.verification_result = verification
-                    st.session_state.trigger_analysis = True
+        with st.status("Agent Operating...", expanded=True) as status:
+            st.write(f"🔌 Connecting to device... [{diag_device_id}]")
+            st.write("🧪 Active probe (simulated): collecting alarms/config/topology context")
+            # 疑似ログ（サニタイズ済み前提）
+            log_lines = []
+            log_lines.append(f"DEVICE={diag_device_id}")
+            log_lines.append(f"PARENT={parent_id}")
+            log_lines.append(f"CHILDREN={children_ids}")
+            if device_alarms:
+                log_lines.append("ALARMS:")
+                for a in device_alarms[:20]:
+                    log_lines.append(f"- {a.get('severity','')}: {a.get('message','')}")
+            else:
+                log_lines.append("ALARMS: (none found for this device in current dataset)")
+            if target_conf:
+                log_lines.append("CONFIG_SNIPPET:")
+                log_lines.append(target_conf[:1500])
+            else:
+                log_lines.append("CONFIG_SNIPPET: (not available)")
 
-                elif res.get("status") == "SKIPPED":
-                    status.update(label="No Action Required", state="complete", expanded=False)
-                else:
-                    st.write("❌ Connection Failed / No response.")
-                    status.update(label="Diagnostics Failed", state="error", expanded=True)
+            log_content = "
+".join(log_lines)
 
-            st.rerun()
+            # 後段（レポート/修復プラン）に渡すために保持
+            if diag_device_id:
+                st.session_state.active_probe_logs[diag_device_id] = log_content
 
-    if st.session_state.live_result:
-        res = st.session_state.live_result
-        if res["status"] == "SUCCESS":
-            st.markdown("#### 📄 Diagnostic Results")
-            with st.container(border=True):
-                if selected_incident_candidate and selected_incident_candidate.get("verification_log"):
-                    st.caption("🤖 Active Probe / Verification Log")
-                    st.code(selected_incident_candidate["verification_log"], language="text")
-                    st.divider()
+            verification = verify_log_content(log_content)
+            st.session_state.verification_result = verification
 
-                if st.session_state.verification_result:
-                    v = st.session_state.verification_result
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Ping Status", v.get('ping_status'))
-                    c2.metric("Interface", v.get('interface_status'))
-                    c3.metric("Hardware", v.get('hardware_status'))
-                
-                st.divider()
-                st.caption("🔒 Raw Logs (Sanitized)")
-                st.code(res["sanitized_log"], language="text")
-        elif res["status"] == "ERROR":
-            st.error(f"診断エラー: {res.get('error')}")
+            st.write("✅ Log Acquired (simulated) & Stored.")
+            status.update(label="Diagnostics Complete!", state="complete", expanded=False)
 
-# === 右カラム: 分析レポート ===
-with col_chat:
-    st.subheader("📝 AI Analyst Report")
-    
-    if selected_incident_candidate:
-        cand = selected_incident_candidate
-        
-        # --- A. 状況報告 (Situation Report) ---
-        if "generated_report" not in st.session_state or st.session_state.generated_report is None:
-            st.info(f"インシデント選択中: **{cand['id']}** ({cand['label']})")
-            
-            if api_key and selected_scenario != "正常稼働":
-                if st.button("📝 詳細レポートを作成 (Generate Report)"):
-                    _ensure_cmd_state()
-                    if st.session_state.get("bundle_cache") is None:
-                        st.session_state.bundle_cache = {}
-                    t_node = TOPOLOGY.get(cand["id"])
-                    t_node_dict = asdict(t_node) if t_node else {}
-                    parent_id = t_node.parent_id if t_node else None
-                    children_ids = [nid for nid, n in TOPOLOGY.items() if getattr(n, "parent_id", None) == cand["id"]]
-                    topology_context = {"node": t_node_dict, "parent_id": parent_id, "children_ids": children_ids}
-                    target_conf = load_config_by_id(cand["id"])
-                    verification_context = st.session_state.active_probe_logs.get(cand["id"]) or cand.get("verification_log") or "特になし"
-                    cache_key = "|".join([selected_scenario, str(cand.get("id")), _hash_text(json.dumps(topology_context, ensure_ascii=False, sort_keys=True)), _hash_text(target_conf), _hash_text(verification_context)])
-                    bundle = st.session_state.bundle_cache.get(cache_key)
-                    if not bundle:
-                        prompt = _generate_bundle_prompt(selected_scenario, cand, topology_context, target_conf, verification_context, force_polite_style=True)
-                        try:
-                            response = generate_content_with_retry(model, prompt, stream=False)
-                            bundle_md = response.text if response else ""
-                        except Exception as e:
-                            st.error(f"LLM Error: {e}")
-                            st.stop()
-                        report_md = _extract_section_by_h3(bundle_md, "運用状況報告") or bundle_md
-                        plan_md = _extract_section_by_h3(bundle_md, "復旧手順書") or bundle_md
-                        recovery_cmds = _extract_first_codeblock_after_heading(plan_md, "復旧コマンド")
-                        verify_cmds = _extract_first_codeblock_after_heading(plan_md, "正常性確認")
-                        expectations = _extract_expectations(bundle_md)
-                        bundle = {"cand_id": cand.get("id"), "bundle_md": bundle_md, "report_md": report_md, "plan_md": plan_md, "recovery_cmds": recovery_cmds, "verify_cmds": verify_cmds, "expectations": expectations, "cache_key": cache_key, "created_at": time.time()}
-                        st.session_state.bundle_cache[cache_key] = bundle
-                    # UIキー同期
-                    st.session_state.last_bundle = bundle
-                    st.session_state.generated_report = bundle.get("report_md") or "レポートが未生成です。"
-                    st.session_state.last_report_cand_id = cand.get("id")
-                    st.session_state.remediation_plan = bundle.get("plan_md")
-                    st.session_state.recovery_commands = bundle.get("recovery_cmds") or st.session_state.recovery_commands
-                    st.session_state.verification_commands = bundle.get("verify_cmds") or st.session_state.verification_commands
-                    st.session_state.expected_results = bundle.get("expectations")
-                    st.rerun()
-
-    # --- B. 自動修復 & チャット ---
     st.markdown("---")
     st.subheader("🤖 Remediation & Chat")
 
