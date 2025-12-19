@@ -110,6 +110,25 @@ def run_diagnostic_simulation_no_llm(selected_scenario, target_node_obj):
 def _hash_text(text: str) -> str:
     import hashlib
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+
+def _extract_first_codeblock_after_heading(markdown_text: str, heading_keyword: str) -> str:
+    """Extract the first fenced code block (``` ... ```) that appears *after* a heading containing heading_keyword.
+    - Returns code content without fences.
+    - If not found, returns empty string.
+    This is intentionally simple and robust to avoid complex parsing / IF sprawl.
+    """
+    if not markdown_text or not heading_keyword:
+        return ""
+    # Find the heading position (supports '#', '##', etc. and also plain text headings)
+    idx = markdown_text.find(heading_keyword)
+    if idx < 0:
+        return ""
+    tail = markdown_text[idx:]
+    # Find first fenced code block after the heading
+    m = re.search(r"```[a-zA-Z0-9_+-]*\s*\n(.*?)\n```", tail, flags=re.DOTALL)
+    if not m:
+        return ""
+    return (m.group(1) or "").strip()
 def render_topology(alarms, root_cause_candidates):
     """トポロジー図の描画 (AI判定結果を反映)"""
     graph = graphviz.Digraph()
@@ -457,14 +476,7 @@ with col_chat:
 
                     # CI/トポロジー情報
                     t_node = TOPOLOGY.get(cand["id"])
-                    t_node_dict = {
-                        "id": getattr(t_node, "id", None),
-                        "type": getattr(t_node, "type", None),
-                        "layer": getattr(t_node, "layer", None),
-                        "metadata": getattr(t_node, "metadata", {}),
-                        "parent": getattr(t_node, "parent", None),
-                        "children": getattr(t_node, "children", []),
-                    } if t_node else {}
+                    t_node_dict = asdict(t_node) if t_node else {}
                     parent_id = t_node.parent_id if t_node else None
                     children_ids = [
                         nid for nid, n in TOPOLOGY.items()
