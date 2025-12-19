@@ -591,8 +591,7 @@ with col_map:
             log_content = "\n".join(probe_lines)
 # patched
 # 
-".join(log_lines)
-
+    log_content = "\n".join(log_lines)
             # 後段（レポート/修復プラン）に渡すために保持
             if diag_device_id:
                 st.session_state.active_probe_logs[diag_device_id] = log_content
