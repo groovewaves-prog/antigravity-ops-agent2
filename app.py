@@ -15,13 +15,61 @@ DEFAULT_GEN_CONFIG = {
 }
 
 def _get_gemini_api_key() -> str:
-    # Streamlit Cloud secrets優先 → 環境変数
+    """Get Gemini API key in a Streamlit-friendly way.
+
+    Priority:
+      1) Streamlit secrets (supports nested sections)
+      2) Environment variables (GEMINI_API_KEY / GOOGLE_API_KEY)
+    """
+
+    # 1) Streamlit secrets: support both flat and nested keys
+    def _find_in_secrets(obj):
+        try:
+            # st.secrets behaves like a Mapping
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if str(k).upper() in {"GEMINI_API_KEY", "GOOGLE_API_KEY"}:
+                        s = str(v).strip()
+                        if s:
+                            return s
+                    # recurse
+                    if isinstance(v, (dict,)):
+                        got = _find_in_secrets(v)
+                        if got:
+                            return got
+            return ""
+        except Exception:
+            return ""
+
     try:
-        if "GEMINI_API_KEY" in st.secrets:
-            return str(st.secrets["GEMINI_API_KEY"]).strip()
+        if hasattr(st, "secrets"):
+            # direct (flat)
+            for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "gemini_api_key", "google_api_key"):
+                try:
+                    if k in st.secrets:
+                        s = str(st.secrets[k]).strip()
+                        if s:
+                            return s
+                except Exception:
+                    pass
+            # nested
+            try:
+                got = _find_in_secrets(dict(st.secrets))
+                if got:
+                    return got
+            except Exception:
+                pass
     except Exception:
         pass
-    return (os.environ.get("GEMINI_API_KEY") or "").strip()
+
+    # 2) Environment variables
+    for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        s = os.environ.get(k, "").strip()
+        if s:
+            return s
+
+    return ""
+
 
 def _init_gemini_model():
     api_key = _get_gemini_api_key()
@@ -890,9 +938,10 @@ with st.sidebar:
 
             # チャットセッション初期化
             if 'chat_session' not in st.session_state:
-                # 修正: すでに作成済みの _llm_model を利用する
-                if _llm_model:
-                    st.session_state.chat_session = _llm_model.start_chat(history=[])
+                api_key = os.environ.get("GEMINI_API_KEY", "")
+                if api_key:
+                    model = _llm_model
+                    st.session_state.chat_session = model.start_chat(history=[])
                 else:
                     st.session_state.chat_session = None
 
