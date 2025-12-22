@@ -5,6 +5,10 @@ import re
 import os
 import time
 import json
+import concurrent.futures
+import hashlib
+from typing import Dict, List
+from enum import Enum
 import google.generativeai as genai
 from netmiko import ConnectHandler
 
@@ -500,3 +504,122 @@ def predict_initial_symptoms(scenario_name, api_key):
     except Exception as e:
         print(f"Symptom Prediction Error: {e}")
         return {}
+
+
+# =====================================================
+# 【新規】パフォーマンス改善：キャッシング + ストリーミング
+# =====================================================
+
+def compute_cache_hash(scenario: str, device_id: str, topology_context: str = "", config: str = "") -> str:
+    """
+    キャッシュキーを生成（MD5ハッシュ）
+    
+    Args:
+        scenario: 障害シナリオ
+        device_id: デバイスID
+        topology_context: トポロジーコンテキスト
+        config: 設定情報
+    
+    Returns:
+        str: 32文字のMD5ハッシュ
+    """
+    content = f"{scenario}|{device_id}|{topology_context}|{config}"
+    return hashlib.md5(content.encode()).hexdigest()
+
+
+def generate_analyst_report_streaming(scenario, target_node, topology_context, target_conf, verification_context, api_key):
+    """
+    ストリーミング版：原因分析専用レポート生成
+    
+    AI の出力を段階的に yield する（Streamlit で段階的表示に対応）
+    
+    Args:
+        scenario: 障害シナリオ
+        target_node: ターゲットノード
+        topology_context: トポロジーコンテキスト
+        target_conf: 対象設定
+        verification_context: 検証コンテキスト
+        api_key: Google API Key
+    
+    Yields:
+        str: AI の出力をチャンク単位で返す
+    """
+    if not api_key:
+        yield "Error: API Key Missing"
+        return
+    
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
+        
+        vendor = target_node.metadata.get("vendor", "Unknown")
+        os_type = target_node.metadata.get("os", "Unknown OS")
+        
+        prompt = f"""
+        ネットワーク障害の原因分析レポートを生成してください。
+        
+        シナリオ: {scenario}
+        デバイス: {target_node.id}
+        ベンダー: {vendor}
+        OS: {os_type}
+        
+        出力: Markdown形式で、以下セクションで構成
+        - 障害概要
+        - 発生原因
+        - 影響範囲
+        - 技術的根拠
+        - 切り分け判断の理由
+        
+        ★重要: 復旧コマンドやロールバック手順は含めないでください。
+        """
+        
+        # ストリーミング有効でレスポンスを取得
+        response = model.generate_content(prompt, stream=True)
+        
+        # チャンク単位で yield
+        for chunk in response:
+            if chunk.text:
+                yield chunk.text
+    
+    except Exception as e:
+        yield f"Error: {e}"
+
+
+def generate_remediation_commands_streaming(scenario, analysis_result, target_node, api_key):
+    """
+    ストリーミング版：復旧手順生成
+    
+    Yields:
+        str: AI の出力をチャンク単位で返す
+    """
+    if not api_key:
+        yield "Error: API Key Missing"
+        return
+    
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
+        
+        prompt = f"""
+        以下の原因分析を踏まえて、復旧手順を生成してください。
+        
+        分析結果: {analysis_result}
+        シナリオ: {scenario}
+        デバイス: {target_node.id}
+        
+        出力フォーマット:
+        - 実施前提・注意点
+        - バックアップ手順
+        - 復旧手順
+        - ロールバック手順
+        - 正常性確認コマンド
+        """
+        
+        response = model.generate_content(prompt, stream=True)
+        
+        for chunk in response:
+            if chunk.text:
+                yield chunk.text
+    
+    except Exception as e:
+        yield f"Error: {e}"
