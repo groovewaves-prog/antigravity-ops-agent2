@@ -358,7 +358,6 @@ def generate_analyst_report(
         logger.error(f"generate_analyst_report error: {e}")
         return f"Error: {e}"
 
-
 def generate_analyst_report_streaming(
     scenario: str,
     target_node,
@@ -369,7 +368,7 @@ def generate_analyst_report_streaming(
     max_retries: int = 2,
     backoff: float = 5.0
 ) -> Generator[str, None, None]:
-    """原因分析レポート生成（ストリーミング版）"""
+    """原因分析レポート生成（ストリーミング版 - 修正済み）"""
     if not api_key:
         yield "Error: API Key Missing"
         return
@@ -391,6 +390,7 @@ def generate_analyst_report_streaming(
     vendor = target_node.metadata.get("vendor", "Unknown")
     os_type = target_node.metadata.get("os", "Unknown OS")
     
+    # プロンプト（変更なし）
     prompt = f"""ネットワーク障害の原因分析
 
 シナリオ: {scenario}
@@ -406,39 +406,55 @@ def generate_analyst_report_streaming(
 
     for attempt in range(max_retries + 1):
         try:
-            response = _call_llm_with_rate_limit(model, prompt, stream=True)
-            
-            if not validate_response(response):
-                if attempt < max_retries:
-                    wait_time = backoff * (attempt + 1)
-                    yield f"\n\n⏳ **再試行中... {wait_time:.0f}秒後**\n\n"
-                    time.sleep(wait_time)
-                    continue
-                yield "❌ 有効な応答が得られませんでした。"
-                return
+            # stream=True で呼び出し
+            response_iterator = _call_llm_with_rate_limit(model, prompt, stream=True)
             
             full_text = ""
-            for chunk in response:
-                if chunk.text:
-                    full_text += chunk.text
-                    yield chunk.text
+            chunk_received = False
             
-            # キャッシュ保存
+            # イテレータを直接回すことで、データが来しだい処理する
+            for chunk in response_iterator:
+                # 安全にテキストを取り出す
+                text_chunk = ""
+                try:
+                    text_chunk = chunk.text
+                except Exception:
+                    # 候補フィルタリング等でtextがない場合のガード
+                    pass
+                
+                if text_chunk:
+                    chunk_received = True
+                    full_text += text_chunk
+                    yield text_chunk
+            
+            # ループを抜けた後に、何も受信できていなければエラーとみなす
+            if not chunk_received:
+                if attempt < max_retries:
+                    wait_time = backoff * (attempt + 1)
+                    yield f"\n\n⏳ **応答が空でした。再試行中... {wait_time:.0f}秒後**\n\n"
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    yield "❌ 有効な応答が得られませんでした（空の応答）。"
+                    return
+            
+            # 正常終了時：キャッシュ保存
             filtered = filter_hallucination(full_text)
             limiter.set_cache(cache_key, filtered)
             return
         
         except Exception as e:
             error_msg = str(e).lower()
-            if any(x in error_msg for x in ['503', '429', 'overloaded']):
+            # 503/429エラー等のハンドリング
+            if any(x in error_msg for x in ['503', '429', 'overloaded', 'quota', 'resource exhausted']):
                 if attempt < max_retries:
                     wait_time = backoff * (attempt + 1)
                     yield f"\n\n⏳ **API混雑中... {wait_time:.0f}秒後に再試行**\n\n"
                     time.sleep(wait_time)
                     continue
-            yield f"❌ エラー: {e}"
+            
+            yield f"❌ エラーが発生しました: {e}"
             return
-
 
 # =====================================================
 # 復旧コマンド生成
