@@ -366,9 +366,9 @@ def generate_analyst_report_streaming(
     verification_context: str,
     api_key: str,
     max_retries: int = 2,
-    backoff: float = 5.0
+    backoff: float = 3.0  # バックオフ時間を短縮
 ) -> Generator[str, None, None]:
-    """原因分析レポート生成（ストリーミング版 - 修正済み）"""
+    """原因分析レポート生成（高速化・軽量版）"""
     if not api_key:
         yield "Error: API Key Missing"
         return
@@ -381,7 +381,7 @@ def generate_analyst_report_streaming(
     limiter = _get_rate_limiter()
     
     # キャッシュチェック
-    cache_key = compute_cache_hash(scenario, target_node.id, "analyst_streaming")
+    cache_key = compute_cache_hash(scenario, target_node.id, "analyst_streaming_light")
     cached = limiter.get_cache(cache_key)
     if cached:
         yield cached
@@ -390,36 +390,31 @@ def generate_analyst_report_streaming(
     vendor = target_node.metadata.get("vendor", "Unknown")
     os_type = target_node.metadata.get("os", "Unknown OS")
     
-    # プロンプト（変更なし）
-    prompt = f"""ネットワーク障害の原因分析
+    # ★プロンプトを大幅に軽量化
+    prompt = f"""ネットワーク障害の分析結果を簡潔に出力せよ。
 
 シナリオ: {scenario}
 デバイス: {target_node.id} ({vendor} {os_type})
 
-以下の構成で記載:
-## 障害概要
-## 発生原因
-## 影響範囲
-## 技術的根拠
-## 切り分け判断
+出力項目（これ以外は不要）:
+1. 【根本原因】: 何が起きたか1行で。
+2. 【特定根拠】: ログやアラームのどの部分で判断したか、技術的根拠のみ箇条書き。
+
+※挨拶、概要、影響範囲、今後の対策は一切不要。
 """
 
     for attempt in range(max_retries + 1):
         try:
-            # stream=True で呼び出し
             response_iterator = _call_llm_with_rate_limit(model, prompt, stream=True)
             
             full_text = ""
             chunk_received = False
             
-            # イテレータを直接回すことで、データが来しだい処理する
             for chunk in response_iterator:
-                # 安全にテキストを取り出す
                 text_chunk = ""
                 try:
                     text_chunk = chunk.text
                 except Exception:
-                    # 候補フィルタリング等でtextがない場合のガード
                     pass
                 
                 if text_chunk:
@@ -427,33 +422,29 @@ def generate_analyst_report_streaming(
                     full_text += text_chunk
                     yield text_chunk
             
-            # ループを抜けた後に、何も受信できていなければエラーとみなす
             if not chunk_received:
                 if attempt < max_retries:
                     wait_time = backoff * (attempt + 1)
-                    yield f"\n\n⏳ **応答が空でした。再試行中... {wait_time:.0f}秒後**\n\n"
+                    yield f"\n\n⏳ **応答遅延... {wait_time:.0f}秒後に再取得**\n\n"
                     time.sleep(wait_time)
                     continue
                 else:
-                    yield "❌ 有効な応答が得られませんでした（空の応答）。"
+                    yield "❌ 混雑のため応答がありませんでした。"
                     return
             
-            # 正常終了時：キャッシュ保存
             filtered = filter_hallucination(full_text)
             limiter.set_cache(cache_key, filtered)
             return
         
         except Exception as e:
             error_msg = str(e).lower()
-            # 503/429エラー等のハンドリング
-            if any(x in error_msg for x in ['503', '429', 'overloaded', 'quota', 'resource exhausted']):
+            if any(x in error_msg for x in ['503', '429', 'overloaded', 'quota']):
                 if attempt < max_retries:
                     wait_time = backoff * (attempt + 1)
                     yield f"\n\n⏳ **API混雑中... {wait_time:.0f}秒後に再試行**\n\n"
                     time.sleep(wait_time)
                     continue
-            
-            yield f"❌ エラーが発生しました: {e}"
+            yield f"❌ エラー: {e}"
             return
 
 # =====================================================
@@ -504,16 +495,15 @@ def generate_remediation_commands(
         logger.error(f"generate_remediation_commands error: {e}")
         return f"Error: {e}"
 
-
 def generate_remediation_commands_streaming(
     scenario: str,
     analysis_result: str,
     target_node,
     api_key: str,
     max_retries: int = 2,
-    backoff: float = 5.0
+    backoff: float = 3.0  # バックオフ時間を短縮
 ) -> Generator[str, None, None]:
-    """復旧手順生成（ストリーミング版 - 修正済み）"""
+    """復旧手順生成（高速化・軽量版）"""
     if not api_key:
         yield "Error: API Key Missing"
         return
@@ -525,36 +515,33 @@ def generate_remediation_commands_streaming(
     
     limiter = _get_rate_limiter()
     
-    # キャッシュチェック
-    cache_key = compute_cache_hash(scenario, target_node.id, "remediation_streaming")
+    cache_key = compute_cache_hash(scenario, target_node.id, "remediation_streaming_light")
     cached = limiter.get_cache(cache_key)
     if cached:
         yield cached
         return
     
-    # プロンプト定義
-    prompt = f"""復旧手順を作成
+    # ★プロンプトをコマンド中心に軽量化
+    prompt = f"""ネットワーク障害の復旧手順とコマンドを作成せよ。
 
 デバイス: {target_node.id}
 シナリオ: {scenario}
 
-以下の構成:
-## 実施前提
-## バックアップ手順
-## 復旧手順
-## ロールバック手順
-## 正常性確認
+出力項目（これ以外は不要）:
+1. 【復旧手順】: 手順を3ステップ以内の箇条書きで。
+2. 【復旧コマンド】: 設定投入するConfigコマンド（コードブロック形式）。
+3. 【正常性確認】: 復旧確認用のshow/pingコマンド（コードブロック形式）。
+
+※挨拶、前提条件、バックアップ、ロールバック手順は省略すること。
 """
 
     for attempt in range(max_retries + 1):
         try:
-            # stream=True で呼び出し
             response_iterator = _call_llm_with_rate_limit(model, prompt, stream=True)
             
             full_text = ""
             chunk_received = False
             
-            # イテレータを回してデータを受信
             for chunk in response_iterator:
                 text_chunk = ""
                 try:
@@ -567,26 +554,23 @@ def generate_remediation_commands_streaming(
                     full_text += text_chunk
                     yield text_chunk
             
-            # 何も受信できなかった場合のチェック
             if not chunk_received:
                 if attempt < max_retries:
                     wait_time = backoff * (attempt + 1)
-                    yield f"\n\n⏳ **応答が空でした。再試行中... {wait_time:.0f}秒後**\n\n"
+                    yield f"\n\n⏳ **応答遅延... {wait_time:.0f}秒後に再取得**\n\n"
                     time.sleep(wait_time)
                     continue
                 else:
-                    yield "❌ 有効な応答が得られませんでした（空の応答）。"
+                    yield "❌ 混雑のため応答がありませんでした。"
                     return
             
-            # 正常終了時：キャッシュ保存
             filtered = filter_hallucination(full_text)
             limiter.set_cache(cache_key, filtered)
             return
         
         except Exception as e:
             error_msg = str(e).lower()
-            # 503/429等のエラーハンドリング
-            if any(x in error_msg for x in ['503', '429', 'overloaded', 'quota', 'resource exhausted']):
+            if any(x in error_msg for x in ['503', '429', 'overloaded', 'quota']):
                 if attempt < max_retries:
                     wait_time = backoff * (attempt + 1)
                     yield f"\n\n⏳ **API混雑中... {wait_time:.0f}秒後に再試行**\n\n"
