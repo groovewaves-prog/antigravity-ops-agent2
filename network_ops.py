@@ -614,7 +614,113 @@ def compute_cache_hash(scenario: str, device_id: str, topology_context: str = ""
     return hashlib.md5(content.encode()).hexdigest()
 
 
-def generate_analyst_report_streaming(scenario, target_node, topology_context, target_conf, verification_context, api_key, max_retries=2, backoff=3):
+def generate_analyst_report_streaming(scenario, target_node, topology_context, target_conf, verification_context, api_key, max_retries=1, backoff=5):
+    """
+    原因分析専用レポート生成（20 req/min 対応版）
+    
+    ★改善: 
+    - 20 req/min 制限に対応した待機時間（backoff=5秒以上）
+    - プロンプト大幅簡潔化
+    - 応答有効性チェック強化
+    
+    Args:
+        scenario: 障害シナリオ
+        target_node: ターゲットノード
+        topology_context: トポロジーコンテキスト
+        target_conf: 対象設定
+        verification_context: 検証コンテキスト
+        api_key: Google API Key
+        max_retries: 最大リトライ回数（デフォルト: 1回）
+        backoff: リトライ待機間隔（秒、デフォルト: 5秒 = 20 req/min 対応）
+    
+    Yields:
+        str: AI の出力をチャンク単位で返す
+    """
+    if not api_key:
+        yield "Error: API Key Missing"
+        return
+    
+    for attempt in range(max_retries + 1):
+        try:
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
+            
+            vendor = target_node.metadata.get("vendor", "Unknown")
+            os_type = target_node.metadata.get("os", "Unknown OS")
+            
+            # ★大幅簡潔化されたプロンプト（セーフティフィルター対策）
+            prompt = f"""ネットワーク障害の原因分析
+
+シナリオ: {scenario}
+デバイス: {target_node.id}
+ベンダー: {vendor}
+OS: {os_type}
+
+以下の構成で分析を記載してください:
+
+## 障害概要
+障害の説明
+
+## 発生原因
+技術的な根拠に基づく原因
+
+## 影響範囲
+影響を受けたシステム
+
+## 技術的根拠
+分析の根拠
+
+## 切り分け判断
+判定プロセス"""
+            
+            # ストリーミング実行（確実性を優先）
+            response = model.generate_content(prompt, stream=True)
+            
+            # ★応答の有効性をチェック
+            if not validate_response(response):
+                if attempt < max_retries:
+                    # 20 req/min 対応：十分な待機時間
+                    wait_time = backoff * (attempt + 1)  # 5秒、10秒...
+                    yield f"\n\n⏳ **API が応答できません。{wait_time}秒後に再試行します...**\n\n"
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    yield "❌ API から有効な応答が得られませんでした。しばらく時間をおいて再度お試しください。"
+                    return
+            
+            # チャンク単位で yield
+            full_text = ""
+            for chunk in response:
+                if chunk.text:
+                    full_text += chunk.text
+                    yield chunk.text
+            
+            # ★ハルシネーション防止フィルターを適用
+            filtered_text = filter_hallucination(full_text)
+            
+            # フィルタリング後のテキストを yield
+            if len(filtered_text) < len(full_text):
+                yield ""
+                yield filtered_text
+            
+            return
+        
+        except Exception as e:
+            error_msg = str(e)
+            
+            # 503エラーの場合はリトライ
+            if "503" in error_msg or "overloaded" in error_msg.lower():
+                if attempt < max_retries:
+                    wait_time = backoff * (attempt + 1)
+                    yield f"\n\n⏳ **API混雑中です。{wait_time}秒後に再試行します...**\n\n"
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    yield f"\n\n❌ **API が混雑しており、レポート生成に失敗しました。しばらく時間をおいて再度お試しください。**"
+                    return
+            else:
+                yield f"❌ エラー: {error_msg}"
+                return
     """
     ストリーミング版：原因分析専用レポート生成
     
@@ -732,7 +838,97 @@ def generate_analyst_report_streaming(scenario, target_node, topology_context, t
                 return
 
 
-def generate_remediation_commands_streaming(scenario, analysis_result, target_node, api_key, max_retries=2, backoff=3):
+def generate_remediation_commands_streaming(scenario, analysis_result, target_node, api_key, max_retries=1, backoff=5):
+    """
+    復旧手順生成（20 req/min 対応版）
+    
+    ★改善: 
+    - 20 req/min 制限に対応した待機時間
+    - プロンプト大幅簡潔化
+    - 応答有効性チェック強化
+    
+    Yields:
+        str: AI の出力をチャンク単位で返す
+    """
+    if not api_key:
+        yield "Error: API Key Missing"
+        return
+    
+    for attempt in range(max_retries + 1):
+        try:
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
+            
+            # ★大幅簡潔化されたプロンプト
+            prompt = f"""復旧手順の生成
+
+シナリオ: {scenario}
+デバイス: {target_node.id}
+
+以下の構成で復旧手順を記載してください:
+
+## 実施前提
+復旧前の確認項目
+
+## バックアップ手順
+現在の状態をバックアップする手順
+
+## 復旧手順
+障害を復旧するための操作（番号付き）
+
+## ロールバック手順
+失敗時に元の状態に戻す手順
+
+## 正常性確認
+復旧完了を確認するコマンド"""
+            
+            response = model.generate_content(prompt, stream=True)
+            
+            # ★応答の有効性をチェック
+            if not validate_response(response):
+                if attempt < max_retries:
+                    # 20 req/min 対応：十分な待機時間
+                    wait_time = backoff * (attempt + 1)
+                    yield f"\n\n⏳ **API が応答できません。{wait_time}秒後に再試行します...**\n\n"
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    yield "❌ API から有効な応答が得られませんでした。しばらく時間をおいて再度お試しください。"
+                    return
+            
+            # チャンク単位で yield
+            full_text = ""
+            for chunk in response:
+                if chunk.text:
+                    full_text += chunk.text
+                    yield chunk.text
+            
+            # ★ハルシネーション防止フィルターを適用
+            filtered_text = filter_hallucination(full_text)
+            
+            # フィルタリング後のテキストを yield
+            if len(filtered_text) < len(full_text):
+                yield ""
+                yield filtered_text
+            
+            return
+        
+        except Exception as e:
+            error_msg = str(e)
+            
+            # 503エラーの場合はリトライ
+            if "503" in error_msg or "overloaded" in error_msg.lower():
+                if attempt < max_retries:
+                    wait_time = backoff * (attempt + 1)
+                    yield f"\n\n⏳ **API混雑中です。{wait_time}秒後に再試行します...**\n\n"
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    yield f"\n\n❌ **API が混雑しており、復旧プラン生成に失敗しました。しばらく時間をおいて再度お試しください。**"
+                    return
+            else:
+                yield f"❌ エラー: {error_msg}"
+                return
     """
     ストリーミング版：復旧手順生成
     
