@@ -669,28 +669,37 @@ with col_chat:
                         full_text = st.session_state.report_cache[cache_key_analyst]
                         report_container.markdown(full_text)
                     else:
-                        # ★パフォーマンス改善: ストリーミング対応
+                        # ★パフォーマンス改善: ストリーミング対応 + エラーハンドリング強化
                         try:
                             report_container.write("🤖 AI 分析中...")
                             placeholder = report_container.empty()
                             full_text = ""
+                            error_occurred = False
                             
                             # ストリーミングで段階的に取得・表示
-                            for chunk in generate_analyst_report_streaming(
-                                scenario=selected_scenario,
-                                target_node=t_node,
-                                topology_context=topology_context,
-                                target_conf=target_conf or "なし",
-                                verification_context=verification_context,
-                                api_key=api_key
-                            ):
-                                full_text += chunk
-                                placeholder.markdown(full_text)  # 段階的に更新
+                            try:
+                                for chunk in generate_analyst_report_streaming(
+                                    scenario=selected_scenario,
+                                    target_node=t_node,
+                                    topology_context=topology_context,
+                                    target_conf=target_conf or "なし",
+                                    verification_context=verification_context,
+                                    api_key=api_key,
+                                    max_retries=2,  # リトライ回数
+                                    backoff=3       # リトライ間隔
+                                ):
+                                    full_text += chunk
+                                    placeholder.markdown(full_text)  # 段階的に更新
+                            except google_exceptions.ServiceUnavailable:
+                                error_occurred = True
+                                full_text += "\n\n⚠️ **API が混雑しています。生成済みレポートを表示します。**"
+                                placeholder.markdown(full_text)
                             
                             if not full_text or full_text.startswith("Error"):
                                 full_text = f"⚠️ 分析レポート生成に失敗しました: {full_text}"
                                 placeholder.markdown(full_text)
                             
+                            # 部分的でもキャッシュに保存
                             st.session_state.report_cache[cache_key_analyst] = full_text
                         except google_exceptions.ServiceUnavailable:
                             full_text = "⚠️ 現在、AIモデルが混雑しています (503 Error)。時間を置いて再度お試しください。"
@@ -744,25 +753,34 @@ with col_chat:
                          remediation_container.markdown(remediation_text)
                      else:
                          try:
-                             # ★パフォーマンス改善: ストリーミング対応
+                             # ★パフォーマンス改善: ストリーミング対応 + エラーハンドリング強化
                              remediation_container.write("🤖 復旧プラン生成中...")
                              placeholder = remediation_container.empty()
                              remediation_text = ""
+                             error_occurred = False
                              
                              # ストリーミングで段階的に取得・表示
-                             for chunk in generate_remediation_commands_streaming(
-                                 scenario=selected_scenario,
-                                 analysis_result=st.session_state.generated_report or "",
-                                 target_node=t_node,
-                                 api_key=api_key
-                             ):
-                                 remediation_text += chunk
-                                 placeholder.markdown(remediation_text)  # 段階的に更新
+                             try:
+                                 for chunk in generate_remediation_commands_streaming(
+                                     scenario=selected_scenario,
+                                     analysis_result=st.session_state.generated_report or "",
+                                     target_node=t_node,
+                                     api_key=api_key,
+                                     max_retries=2,  # リトライ回数
+                                     backoff=3       # リトライ間隔
+                                 ):
+                                     remediation_text += chunk
+                                     placeholder.markdown(remediation_text)  # 段階的に更新
+                             except google_exceptions.ServiceUnavailable:
+                                 error_occurred = True
+                                 remediation_text += "\n\n⚠️ **API が混雑しています。生成済みプランを表示します。**"
+                                 placeholder.markdown(remediation_text)
                              
                              if not remediation_text or remediation_text.startswith("Error"):
                                  remediation_text = f"⚠️ 復旧プラン生成に失敗しました: {remediation_text}"
                                  placeholder.markdown(remediation_text)
                              
+                             # 部分的でもキャッシュに保存
                              st.session_state.report_cache[cache_key_remediation] = remediation_text
                          except google_exceptions.ServiceUnavailable:
                              remediation_text = "⚠️ 現在、AIモデルが混雑しています (503 Error)。時間を置いて再度お試しください。"
