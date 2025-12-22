@@ -513,7 +513,7 @@ def generate_remediation_commands_streaming(
     max_retries: int = 2,
     backoff: float = 5.0
 ) -> Generator[str, None, None]:
-    """復旧手順生成（ストリーミング版）"""
+    """復旧手順生成（ストリーミング版 - 修正済み）"""
     if not api_key:
         yield "Error: API Key Missing"
         return
@@ -525,12 +525,14 @@ def generate_remediation_commands_streaming(
     
     limiter = _get_rate_limiter()
     
+    # キャッシュチェック
     cache_key = compute_cache_hash(scenario, target_node.id, "remediation_streaming")
     cached = limiter.get_cache(cache_key)
     if cached:
         yield cached
         return
     
+    # プロンプト定義
     prompt = f"""復旧手順を作成
 
 デバイス: {target_node.id}
@@ -546,30 +548,45 @@ def generate_remediation_commands_streaming(
 
     for attempt in range(max_retries + 1):
         try:
-            response = _call_llm_with_rate_limit(model, prompt, stream=True)
-            
-            if not validate_response(response):
-                if attempt < max_retries:
-                    wait_time = backoff * (attempt + 1)
-                    yield f"\n\n⏳ **再試行中... {wait_time:.0f}秒後**\n\n"
-                    time.sleep(wait_time)
-                    continue
-                yield "❌ 有効な応答が得られませんでした。"
-                return
+            # stream=True で呼び出し
+            response_iterator = _call_llm_with_rate_limit(model, prompt, stream=True)
             
             full_text = ""
-            for chunk in response:
-                if chunk.text:
-                    full_text += chunk.text
-                    yield chunk.text
+            chunk_received = False
             
+            # イテレータを回してデータを受信
+            for chunk in response_iterator:
+                text_chunk = ""
+                try:
+                    text_chunk = chunk.text
+                except Exception:
+                    pass
+                
+                if text_chunk:
+                    chunk_received = True
+                    full_text += text_chunk
+                    yield text_chunk
+            
+            # 何も受信できなかった場合のチェック
+            if not chunk_received:
+                if attempt < max_retries:
+                    wait_time = backoff * (attempt + 1)
+                    yield f"\n\n⏳ **応答が空でした。再試行中... {wait_time:.0f}秒後**\n\n"
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    yield "❌ 有効な応答が得られませんでした（空の応答）。"
+                    return
+            
+            # 正常終了時：キャッシュ保存
             filtered = filter_hallucination(full_text)
             limiter.set_cache(cache_key, filtered)
             return
         
         except Exception as e:
             error_msg = str(e).lower()
-            if any(x in error_msg for x in ['503', '429', 'overloaded']):
+            # 503/429等のエラーハンドリング
+            if any(x in error_msg for x in ['503', '429', 'overloaded', 'quota', 'resource exhausted']):
                 if attempt < max_retries:
                     wait_time = backoff * (attempt + 1)
                     yield f"\n\n⏳ **API混雑中... {wait_time:.0f}秒後に再試行**\n\n"
@@ -577,7 +594,6 @@ def generate_remediation_commands_streaming(
                     continue
             yield f"❌ エラー: {e}"
             return
-
 
 # =====================================================
 # 診断シミュレーション
