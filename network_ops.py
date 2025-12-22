@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-AIOps Agent - Network Operations Module (Improved v2)
+AIOps Agent - Network Operations Module (Improved v2 - Final Optimized)
 =====================================================
 改善点:
 1. グローバルレートリミッター統合
 2. キャッシュ活用強化
-3. プロンプト最適化（トークン削減）
-4. 429/503エラーの統一的なハンドリング
-5. ストリーミング応答の安定化
+3. プロンプト最適化（トークン削減とコンテキスト維持のバランス）
+4. ストリーミング応答の安定化（429/503エラーハンドリング強化）
+5. セキュリティ対策（Config情報の自動サニタイズ）
 """
 
 import re
@@ -116,13 +116,15 @@ def _ensure_api_configured(api_key: str) -> Optional[genai.GenerativeModel]:
 # ユーティリティ関数
 # =====================================================
 def sanitize_output(text: str) -> str:
+    """機密情報のマスク処理"""
     rules = [
         (r'(password|secret) \d+ \S+', r'\1 <HIDDEN>'),
+        (r'(encrypted-password)\s+"[^"]+"', r'\1 "<HIDDEN>"'),
         (r'(encrypted password) \S+', r'\1 <HIDDEN>'),
         (r'(snmp-server community) \S+', r'\1 <HIDDEN>'),
         (r'(username \S+ privilege \d+ secret \d+) \S+', r'\1 <HIDDEN>'),
-        (r'\b(?!(?:10|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.)\d{1,3}\.(?:\d{1,3}\.){2}\d{1,3}\b', '<MASKED_IP>'),
-        (r'([0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}', '<MASKED_MAC>'),
+        # プライベートIPはデモ用に残す場合もあるが、ここではグローバルのみマスクの例、
+        # あるいは一律マスクなどポリシーによる。今回はパスワード系を重点的に。
     ]
     for pattern, replacement in rules:
         text = re.sub(pattern, replacement, text)
@@ -152,7 +154,7 @@ def filter_hallucination(text: str) -> str:
 
 
 def validate_response(response) -> bool:
-    """APIレスポンスの有効性チェック"""
+    """APIレスポンスの有効性チェック（非ストリーミング用）"""
     try:
         if not response or not hasattr(response, 'candidates'):
             return False
@@ -237,7 +239,6 @@ def generate_fake_log_by_ai(scenario_name: str, target_node, api_key: str) -> st
     os_type = target_node.metadata.get("os", "Generic OS")
     hostname = target_node.id
     
-    # ★最適化されたプロンプト（トークン削減）
     prompt = f"""CLIシミュレータ。障害ログを生成。
 
 ホスト: {hostname}
@@ -281,7 +282,6 @@ def predict_initial_symptoms(scenario_name: str, api_key: str) -> Dict:
     if cached:
         return cached
     
-    # ★最適化されたプロンプト
     prompt = f"""シナリオ「{scenario_name}」の初期症状をJSON出力。
 
 キー: alarm, ping, log
@@ -305,7 +305,7 @@ def predict_initial_symptoms(scenario_name: str, api_key: str) -> Dict:
 
 
 # =====================================================
-# 原因分析レポート生成（ストリーミング）
+# 原因分析レポート生成
 # =====================================================
 def generate_analyst_report(
     scenario: str, 
@@ -358,6 +358,7 @@ def generate_analyst_report(
         logger.error(f"generate_analyst_report error: {e}")
         return f"Error: {e}"
 
+
 def generate_analyst_report_streaming(
     scenario: str,
     target_node,
@@ -366,9 +367,9 @@ def generate_analyst_report_streaming(
     verification_context: str,
     api_key: str,
     max_retries: int = 2,
-    backoff: float = 3.0  # バックオフ時間を短縮
+    backoff: float = 2.0
 ) -> Generator[str, None, None]:
-    """原因分析レポート生成（高速化・軽量版）"""
+    """原因分析レポート生成（セキュリティ＆コンテキスト対応版）"""
     if not api_key:
         yield "Error: API Key Missing"
         return
@@ -380,8 +381,7 @@ def generate_analyst_report_streaming(
     
     limiter = _get_rate_limiter()
     
-    # キャッシュチェック
-    cache_key = compute_cache_hash(scenario, target_node.id, "analyst_streaming_light")
+    cache_key = compute_cache_hash(scenario, target_node.id, "analyst_streaming_final")
     cached = limiter.get_cache(cache_key)
     if cached:
         yield cached
@@ -390,17 +390,27 @@ def generate_analyst_report_streaming(
     vendor = target_node.metadata.get("vendor", "Unknown")
     os_type = target_node.metadata.get("os", "Unknown OS")
     
-    # ★プロンプトを大幅に軽量化
-    prompt = f"""ネットワーク障害の分析結果を簡潔に出力せよ。
+    # プロンプト構成（具体的情報を復活）
+    prompt = f"""あなたは熟練のネットワークエンジニアです。
+以下の情報を元に、障害原因を特定し、技術的根拠を示してください。
 
-シナリオ: {scenario}
-デバイス: {target_node.id} ({vendor} {os_type})
+【対象機器】
+Hostname: {target_node.id} ({vendor} {os_type})
 
-出力項目（これ以外は不要）:
-1. 【根本原因】: 何が起きたか1行で。
-2. 【特定根拠】: ログやアラームのどの部分で判断したか、技術的根拠のみ箇条書き。
+【発生しているログ・アラーム (Fact)】
+{verification_context}
 
-※挨拶、概要、影響範囲、今後の対策は一切不要。
+【障害シナリオ】
+{scenario}
+
+【出力要件】
+以下の2項目のみを簡潔に出力すること（挨拶不要）。
+
+1. ■ 根本原因
+(ログに基づき、何が起きているか具体的に断定する)
+
+2. ■ 特定根拠
+(どのログメッセージ、どのアラームから判断したか。技術的な裏付けを箇条書きで)
 """
 
     for attempt in range(max_retries + 1):
@@ -412,10 +422,8 @@ def generate_analyst_report_streaming(
             
             for chunk in response_iterator:
                 text_chunk = ""
-                try:
-                    text_chunk = chunk.text
-                except Exception:
-                    pass
+                try: text_chunk = chunk.text
+                except Exception: pass
                 
                 if text_chunk:
                     chunk_received = True
@@ -432,20 +440,21 @@ def generate_analyst_report_streaming(
                     yield "❌ 混雑のため応答がありませんでした。"
                     return
             
+            # 完了時にキャッシュ
             filtered = filter_hallucination(full_text)
             limiter.set_cache(cache_key, filtered)
             return
         
         except Exception as e:
-            error_msg = str(e).lower()
-            if any(x in error_msg for x in ['503', '429', 'overloaded', 'quota']):
+            if any(x in str(e).lower() for x in ['503', '429', 'overloaded']):
                 if attempt < max_retries:
                     wait_time = backoff * (attempt + 1)
-                    yield f"\n\n⏳ **API混雑中... {wait_time:.0f}秒後に再試行**\n\n"
+                    yield f"\n\n⏳ **API待機中... {wait_time:.0f}秒後**\n\n"
                     time.sleep(wait_time)
                     continue
             yield f"❌ エラー: {e}"
             return
+
 
 # =====================================================
 # 復旧コマンド生成
@@ -456,7 +465,7 @@ def generate_remediation_commands(
     target_node,
     api_key: str
 ) -> str:
-    """復旧手順生成"""
+    """復旧手順生成（非ストリーミング）"""
     if not api_key:
         return "Error: API Key Missing"
     
@@ -495,15 +504,16 @@ def generate_remediation_commands(
         logger.error(f"generate_remediation_commands error: {e}")
         return f"Error: {e}"
 
+
 def generate_remediation_commands_streaming(
     scenario: str,
     analysis_result: str,
     target_node,
     api_key: str,
     max_retries: int = 2,
-    backoff: float = 3.0  # バックオフ時間を短縮
+    backoff: float = 2.0
 ) -> Generator[str, None, None]:
-    """復旧手順生成（高速化・軽量版）"""
+    """復旧手順生成（Config読込・セキュリティサニタイズ適用版）"""
     if not api_key:
         yield "Error: API Key Missing"
         return
@@ -515,24 +525,54 @@ def generate_remediation_commands_streaming(
     
     limiter = _get_rate_limiter()
     
-    cache_key = compute_cache_hash(scenario, target_node.id, "remediation_streaming_light")
+    cache_key = compute_cache_hash(scenario, target_node.id, "remediation_streaming_final")
     cached = limiter.get_cache(cache_key)
     if cached:
         yield cached
         return
     
-    # ★プロンプトをコマンド中心に軽量化
-    prompt = f"""ネットワーク障害の復旧手順とコマンドを作成せよ。
+    # 1. Configファイルの読み込み
+    current_config_content = ""
+    try:
+        # 複数のパス候補を探す
+        paths = [f"configs/{target_node.id}.txt", f"{target_node.id}.txt"]
+        for p in paths:
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    current_config_content = f.read()
+                break
+    except Exception:
+        pass
 
-デバイス: {target_node.id}
-シナリオ: {scenario}
+    # 2. 【セキュリティ対策】読み込んだConfigをサニタイズ（パスワード除去）
+    if current_config_content:
+        current_config_content = sanitize_output(current_config_content)
+    
+    # プロンプト構成
+    prompt = f"""あなたは熟練のネットワークエンジニアです。
+現在稼働中の設定(Current Config)に基づき、障害復旧手順を作成してください。
+【重要】架空のIPアドレスは使用せず、必ずConfig内の値を使用すること。
 
-出力項目（これ以外は不要）:
-1. 【復旧手順】: 手順を3ステップ以内の箇条書きで。
-2. 【復旧コマンド】: 設定投入するConfigコマンド（コードブロック形式）。
-3. 【正常性確認】: 復旧確認用のshow/pingコマンド（コードブロック形式）。
+【対象機器】
+{target_node.id}
 
-※挨拶、前提条件、バックアップ、ロールバック手順は省略すること。
+【現在の設定 (Current Config / Sanitized)】
+{current_config_content[:3000] if current_config_content else "Config取得不可。一般的な手順を作成せよ。"}
+
+【障害シナリオ】
+{scenario}
+
+【出力要件】
+以下の3項目のみを出力。余計な解説は不要。
+
+1. ■ 復旧手順 (3ステップ以内)
+(物理的なアクションが必要な場合は明記)
+
+2. ■ 復旧コマンド (Config投入用)
+(コードブロック形式。Configに含まれる具体的なInterface名やIPを使用すること)
+
+3. ■ 正常性確認 (Verification)
+(Pingの宛先はConfig内の対向IPなどを使用すること)
 """
 
     for attempt in range(max_retries + 1):
@@ -544,10 +584,8 @@ def generate_remediation_commands_streaming(
             
             for chunk in response_iterator:
                 text_chunk = ""
-                try:
-                    text_chunk = chunk.text
-                except Exception:
-                    pass
+                try: text_chunk = chunk.text
+                except Exception: pass
                 
                 if text_chunk:
                     chunk_received = True
@@ -569,15 +607,15 @@ def generate_remediation_commands_streaming(
             return
         
         except Exception as e:
-            error_msg = str(e).lower()
-            if any(x in error_msg for x in ['503', '429', 'overloaded', 'quota']):
+            if any(x in str(e).lower() for x in ['503', '429', 'overloaded']):
                 if attempt < max_retries:
                     wait_time = backoff * (attempt + 1)
-                    yield f"\n\n⏳ **API混雑中... {wait_time:.0f}秒後に再試行**\n\n"
+                    yield f"\n\n⏳ **API待機中... {wait_time:.0f}秒後**\n\n"
                     time.sleep(wait_time)
                     continue
             yield f"❌ エラー: {e}"
             return
+
 
 # =====================================================
 # 診断シミュレーション
