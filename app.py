@@ -935,7 +935,7 @@ with col_chat:
                 st.markdown("""
                 <div style="background-color:#e8f5e9;padding:10px;border-radius:5px;border:1px solid #4caf50;color:#2e7d32;margin-bottom:10px;">
                     <strong>✅ 正常稼働中</strong><br>
-                    現在、システムは正常に稼働しています。対応が必要なインシデントはありません。
+                    現在、ネットワークは正常に稼働しています。対応が必要なインシデントはありません。
                 </div>
                 """, unsafe_allow_html=True)
             else:
