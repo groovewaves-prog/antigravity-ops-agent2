@@ -5,6 +5,7 @@ from enum import Enum
 from typing import List, Dict, Any, Optional
 
 import google.generativeai as genai
+from model_config import REASONING_MODEL
 
 # ==========================================================
 # AIOps health status
@@ -118,7 +119,7 @@ class LogicalRCA:
             return False
         try:
             genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel("gemini-1.5-flash")
+            self.model = genai.GenerativeModel(REASONING_MODEL)
             self._api_configured = True
             return True
         except Exception as e:

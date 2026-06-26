@@ -2,9 +2,10 @@
 """
 AIOps Agent - Global Rate Limiter Module (v3 - Complete)
 =========================================================
-gemma-3-12b-it の制限:
-- 30 RPM / 14,400 RPD
-- 128,000 入力トークン / 8,192 出力トークン
+レート制限（モデル/ティアにより異なる。以下は旧 gemma-3-12b-it 無料枠の目安）:
+- 使用モデルIDは model_config.py の GEMMA_MODEL で一元管理
+- 上限は使用モデル/課金ティアごとに Google の Rate Limits ドキュメントで要確認
+- 参考値（旧）: 30 RPM / 14,400 RPD / 128,000 入力・8,192 出力トークン
 """
 
 import time

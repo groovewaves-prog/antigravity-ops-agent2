@@ -10,6 +10,7 @@ from google.api_core import exceptions as google_exceptions
 
 # モジュール群のインポート
 from data import TOPOLOGY
+from model_config import GEMMA_MODEL
 from logic import CausalInferenceEngine, Alarm, simulate_cascade_failure
 from network_ops import (
     run_diagnostic_simulation, 
@@ -987,7 +988,7 @@ with col_chat:
 
         if st.session_state.chat_session is None and api_key:
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel("gemma-3-12b-it")
+            model = genai.GenerativeModel(GEMMA_MODEL)
             st.session_state.chat_session = model.start_chat(history=[])
 
         # タブでレイアウトを整理

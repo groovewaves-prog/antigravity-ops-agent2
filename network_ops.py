@@ -22,13 +22,14 @@ import google.generativeai as genai
 from netmiko import ConnectHandler
 
 from rate_limiter import GlobalRateLimiter, RateLimitConfig
+from model_config import GEMMA_MODEL
 
 logger = logging.getLogger(__name__)
 
 # =====================================================
 # 定数
 # =====================================================
-MODEL_NAME = "gemma-3-12b-it"
+MODEL_NAME = GEMMA_MODEL
 
 SANDBOX_DEVICE = {
     'device_type': 'cisco_nxos',
